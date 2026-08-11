@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>VISION</title>
+  <link rel="stylesheet" href="style.css?v=2">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+
+  <div id="vision-hud">
+    <div class="core-wrapper">
+      <canvas id="orb-canvas"></canvas>
+      <div class="orb-label">
+        <span class="core-text">VISION</span>
+        <span id="status-text" class="status-text">idle</span>
+      </div>
+    </div>
+
+    <div id="response-box" class="response-box"></div>
+
+    <div id="code-panel" class="code-panel">
+      <div class="code-panel-header">
+        <span id="code-lang" class="code-lang"></span>
+        <button id="code-copy-btn" class="code-copy-btn">Copy</button>
+      </div>
+      <pre id="code-content" class="code-content"></pre>
+    </div>
+
+    <div id="search-panel" class="code-panel search-panel">
+      <div class="code-panel-header">
+        <span id="search-query-label" class="code-lang"></span>
+      </div>
+      <div id="search-images" class="search-images"></div>
+      <div id="search-results" class="search-results"></div>
+    </div>
+
+    <div id="exec-panel" class="code-panel exec-panel">
+      <div class="code-panel-header">
+        <span class="code-lang">EXECUTION RESULT</span>
+      </div>
+      <pre id="exec-code" class="code-content exec-code"></pre>
+      <div id="exec-output" class="exec-output"></div>
+    </div>
+
+    <div id="screen-indicator" class="screen-indicator">
+      <span class="screen-dot"></span> WATCHING SCREEN
+    </div>
+
+    <div id="camera-indicator" class="screen-indicator camera-indicator">
+      <span class="screen-dot"></span> CAMERA ACTIVE
+    </div>
+
+    <div id="page-render-overlay" class="page-render-overlay">
+      <iframe id="page-render-frame" class="page-render-frame" sandbox="allow-scripts"></iframe>
+    </div>
+  </div>
+
+  <script type="module" src="orb.js?v=6"></script>
+  <script src="app.js?v=2"></script>
+</body>
+</html>

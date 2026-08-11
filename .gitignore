@@ -1,0 +1,35 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Personal data / local databases (conversation history + semantic memory)
+memory/vision.db
+memory/chroma_store/
+
+# Logs
+logs/*.log
+
+# Orphaned experimental Next.js prototype — not part of the running app,
+# has its own nested .git repo and a 500MB+ node_modules/.next.
+ai-dashboard/
+
+# Node (defensive, in case any JS tooling is added later)
+node_modules/
+.next/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Local editor/agent tooling config, not part of the app
+.claude/

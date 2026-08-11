@@ -1,0 +1,21 @@
+# Core
+python-dotenv
+openai
+
+# UI
+pywebview
+
+# Voice
+pywhispercpp
+sounddevice
+pvporcupine
+
+# System / utils
+requests
+google-genai
+mss
+Pillow
+opencv-python
+chromadb
+sentence-transformers
+tavily-python
