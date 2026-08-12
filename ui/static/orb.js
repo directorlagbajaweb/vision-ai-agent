@@ -130,6 +130,7 @@ orbGroup.add(flare);
 const STATE_PRESETS = {
   idle:            { speed: 0.05,  amp: 0.05, freq: 1.1, flow: 0.18, pulse: 0.12 },
   listening:       { speed: 0.10,  amp: 0.08, freq: 1.5, flow: 0.4,  pulse: 0.35 },
+  processing:      { speed: 0.14,  amp: 0.12, freq: 2.0, flow: 0.7,  pulse: 0.6 },
   speaking:        { speed: 0.18,  amp: 0.20, freq: 2.6, flow: 1.3,  pulse: 1.0 },
   muted:           { speed: 0.015, amp: 0.02, freq: 0.8, flow: 0.05, pulse: 0.04 },
   reconnecting:    { speed: 0.12,  amp: 0.06, freq: 1.0, flow: 0.5,  pulse: 0.45 },

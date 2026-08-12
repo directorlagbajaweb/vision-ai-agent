@@ -114,6 +114,38 @@ body, html {
   vertical-align: middle;
 }
 
+.mute-btn {
+  position: absolute;
+  bottom: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: rgba(10, 14, 24, 0.6);
+  border: 1px solid color-mix(in srgb, var(--state-glow) 40%, transparent);
+  color: var(--state-glow);
+  font-size: 15px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(8px);
+  transition: border-color 0.3s ease, color 0.3s ease, background 0.3s ease, box-shadow 0.2s ease;
+  z-index: 10;
+}
+.mute-btn:hover {
+  box-shadow: 0 0 16px color-mix(in srgb, var(--state-glow) 50%, transparent);
+}
+.mute-btn.muted {
+  color: #ff5d5d;
+  border-color: rgba(255, 93, 93, 0.5);
+  background: rgba(40, 10, 10, 0.6);
+}
+.mute-btn.muted:hover {
+  box-shadow: 0 0 16px rgba(255, 93, 93, 0.5);
+}
+
 .glow-ring.muted .ring-base { stroke: #444; opacity: 0.4; }
 .glow-ring.muted { filter: none; }
 

@@ -1,6 +1,8 @@
 const statusText = document.getElementById('status-text');
 const responseBox = document.getElementById('response-box');
 const hud = document.getElementById('vision-hud');
+const muteBtn = document.getElementById('mute-btn');
+const muteIcon = document.getElementById('mute-icon');
 
 const codePanel = document.getElementById('code-panel');
 const codeContent = document.getElementById('code-content');
@@ -132,6 +134,28 @@ window.renderWebpage = renderWebpage;
 window.closeVisualPanel = closeVisualPanel;
 window.setScreenActive = setScreenActive;
 window.setCameraActive = setCameraActive;
+
+let isMuted = false;
+
+muteBtn.addEventListener('click', async () => {
+  isMuted = !isMuted;
+  muteBtn.classList.toggle('muted', isMuted);
+  muteIcon.textContent = isMuted ? '✕' : '●';
+  muteBtn.title = isMuted ? 'Unmute VISION' : 'Mute VISION';
+
+  // Optimistic UI feedback — the backend also sets this on its own status
+  // transitions, but this makes the button feel instant rather than
+  // waiting for the next natural state change.
+  setStatus(isMuted ? 'muted' : 'listening');
+
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.toggle_mute) {
+    try {
+      await window.pywebview.api.toggle_mute(isMuted);
+    } catch (e) {
+      console.error('toggle_mute failed:', e);
+    }
+  }
+});
 
 codeCopyBtn.addEventListener('click', async () => {
   try {

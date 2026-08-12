@@ -33,6 +33,7 @@ from system_control import computer_control
 from system_control.dispatcher import dispatch
 from system_control.mac_actions import get_calendar_events
 from voice.stt import record_audio, transcribe
+from voice.acoustic_cues import play_acoustic_cue
 
 LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS = 1
@@ -42,7 +43,6 @@ CHUNK_SIZE = 1024
 
 WAKE_PHRASE = config.WAKE_WORD.lower()
 WAKE_CHUNK_DURATION = 3.0
-ACTIVE_TIMEOUT = 30
 SHUTDOWN_GRACE_PERIOD = 2.0
 SCREEN_CAPTURE_INTERVAL = 2.0
 CAMERA_CAPTURE_INTERVAL = 2.0
@@ -72,7 +72,11 @@ SYSTEM_PROMPT = (
     f"When asked to build a webpage, landing page, or website, write complete HTML "
     f"with inline CSS/JS and call show_code with language 'html'. If the user then "
     f"asks you to run, show, or preview it, call render_webpage with that same full "
-    f"HTML content — it will render live and full-screen for them. "
+    f"HTML content — it will render live and full-screen for them. render_webpage is "
+    f"ONLY for pages you wrote yourself — never call it to try to show a real "
+    f"website like YouTube, Spotify's web player, or any site with a real URL; it "
+    f"cannot load real external content, and doing this instead of actually "
+    f"navigating a real browser is a mistake. "
     f"When the user asks what's on their screen, call view_screen, describe what "
     f"you see, then ask if they want you to keep watching; only call "
     f"stop_viewing_screen once they confirm. "
@@ -107,16 +111,52 @@ SYSTEM_PROMPT = (
     f"When the user asks you to complete a task by directly using their screen — "
     f"opening an app, clicking something, searching within an app, filling in a "
     f"field, playing a song, and similar multi-step actions — call start_computer_use "
-    f"with a short description of the goal. Once confirmed, you'll get a screenshot "
-    f"automatically; from then on, repeat: look at the most recent screenshot, decide "
+    f"with a short description of the goal. Prefer the most reliable path to the "
+    f"goal, not the most literal one: for anything that involves finding or opening "
+    f"a specific real thing on a website (a video, a song, an article), first use "
+    f"web_search to find a concrete, real URL for it, then call open_url with that "
+    f"exact URL to navigate straight there — this is far more reliable than opening "
+    f"a blank browser and clicking around hoping to find it. Only fall back to "
+    f"clicking around a site's own UI (via computer_control, after open_url got you "
+    f"there) for things a URL can't do — pressing play if it doesn't autoplay, "
+    f"skipping an ad, searching within the site itself. Once confirmed, you'll get a "
+    f"screenshot automatically; from then on, repeat: look at the most recent "
+    f"screenshot, decide "
     f"one next action, call computer_control with exactly one action (mouse_move, "
-    f"left_click, double_click, type_text, press_key, or take_screenshot), then look "
+    f"left_click, double_click, right_click, scroll, type_text, press_key, "
+    f"take_screenshot, or zoom_screenshot), then look "
     f"at the new screenshot you're sent before deciding the next one. Keep going on "
     f"your own without asking the user again after each step — only speak up if you're "
     f"stuck, need information only they have, or the task looks done. Call "
-    f"take_screenshot if you're ever unsure what's currently on screen. When the goal "
-    f"is complete, or you're told you've hit the step limit, call end_computer_use and "
-    f"briefly tell the user what happened."
+    f"take_screenshot if you're ever unsure what's currently on screen — including right "
+    f"after a click, if the screen still looks like it's mid-transition or loading. "
+    f"Small on-screen targets are the hardest thing for you to click precisely, so prefer "
+    f"a keyboard shortcut over a pixel-precise click whenever one exists for what you're "
+    f"trying to do (e.g. space to play/pause media, arrow keys to navigate, enter to "
+    f"activate a focused/default button, cmd+f to find something instead of hunting for "
+    f"a search icon). When you do have to click something small or you're not confident "
+    f"exactly where it is (a Skip Ad button, a small icon), call zoom_screenshot with "
+    f"your best-guess x,y first — you'll get a magnified close-up, and your next "
+    f"coordinates should be given relative to THAT zoomed image, not the original. For "
+    f"anything genuinely important, you can also mouse_move to your best guess, "
+    f"take_screenshot, and visually check whether the cursor actually landed on the "
+    f"target before committing to left_click — the cursor itself is visible in "
+    f"screenshots, so use it to confirm your aim, adjusting with another mouse_move if "
+    f"it's off. Video players and many web UIs hide their controls (play/pause, "
+    f"progress bar, Skip Ad) until the mouse moves over the content — if expected "
+    f"controls aren't visible, mouse_move over the video/content area first, then "
+    f"take_screenshot again before deciding your next click. When you do have to click "
+    f"a plain target, aim for the visual center and prefer larger, unambiguous elements "
+    f"(a labeled button or menu item) over small icons when both accomplish the same "
+    f"thing. Be accurate about what actually happened: never tell the user something "
+    f"is playing, done, or worked unless you can actually see the evidence of it in "
+    f"your most recent screenshot (a video's paused/playing controls, a progress bar "
+    f"that has moved, the specific page you meant to reach) — if you're not sure, "
+    f"take another screenshot and check before saying anything. If several attempts "
+    f"at something aren't working, say so honestly and ask the user rather than "
+    f"claiming it worked. When the goal is complete, or you're told you've hit the "
+    f"step limit, call end_computer_use and briefly tell the user what actually "
+    f"happened, including if it didn't fully work."
 )
 
 TOOL_DECLARATIONS = [
@@ -180,8 +220,12 @@ TOOL_DECLARATIONS = [
         "name": "render_webpage",
         "description": (
             "Renders a complete HTML page full-screen so the user can see it live "
-            "and interact with it — use this when the user asks to run, show, "
-            "preview, or open a webpage/landing page you wrote."
+            "and interact with it — use this ONLY for a page YOU wrote yourself (a "
+            "landing page, a demo, code you were asked to preview). NEVER use this "
+            "to try to show a real external website (YouTube, a news site, anything "
+            "with a real URL) — it can't load real external content. To interact "
+            "with a real website, use start_computer_use/computer_control on an "
+            "actual browser instead."
         ),
         "parameters": {"type": "OBJECT", "properties": {"html": {"type": "STRING"}}, "required": ["html"]},
     },
@@ -318,24 +362,28 @@ TOOL_DECLARATIONS = [
         "name": "computer_control",
         "description": (
             "Performs one GUI action as part of an active computer-use task (see "
-            "start_computer_use) — moving/clicking the mouse, typing text, pressing a "
-            "key, or taking a screenshot. After every call, a fresh screenshot is sent "
-            "to you automatically — look at it before deciding your next action. "
-            "Coordinates are pixel positions within that most recent screenshot. Keep "
-            "calling this one action at a time, autonomously, until the goal is done or "
-            "you're told the step limit was reached."
+            "start_computer_use) — moving/clicking/right-clicking/scrolling, typing "
+            "text, pressing a key, taking a screenshot, or zooming in on a region. "
+            "After every call, a fresh screenshot is sent to you automatically — look "
+            "at it before deciding your next action. Coordinates are pixel positions "
+            "within that most recent screenshot (the zoomed-in one, if your last call "
+            "was zoom_screenshot — not the original full screen). Keep calling this "
+            "one action at a time, autonomously, until the goal is done or you're told "
+            "the step limit was reached."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "One of: mouse_move, left_click, double_click, type_text, press_key, take_screenshot",
+                    "description": "One of: mouse_move, left_click, double_click, right_click, scroll, type_text, press_key, take_screenshot, zoom_screenshot",
                 },
-                "x": {"type": "INTEGER", "description": "X coordinate in the last screenshot, for mouse_move/left_click/double_click"},
-                "y": {"type": "INTEGER", "description": "Y coordinate in the last screenshot, for mouse_move/left_click/double_click"},
+                "x": {"type": "INTEGER", "description": "X coordinate in the last screenshot, for mouse_move/left_click/double_click/right_click/zoom_screenshot"},
+                "y": {"type": "INTEGER", "description": "Y coordinate in the last screenshot, for mouse_move/left_click/double_click/right_click/zoom_screenshot"},
                 "text": {"type": "STRING", "description": "Text to type, for type_text"},
                 "key": {"type": "STRING", "description": "Key to press, for press_key, e.g. 'enter', 'tab', 'cmd+a'"},
+                "direction": {"type": "STRING", "description": "One of: up, down, left, right — for scroll"},
+                "amount": {"type": "INTEGER", "description": "For scroll, lines to scroll (default 3). For zoom_screenshot, half-width in pixels of the region to zoom into around x,y (default 200 — smaller means more magnified)"},
             },
             "required": ["action"],
         },
@@ -368,6 +416,8 @@ class VisionLive:
         self._is_speaking = False
         self._active = False
         self._last_active_time = 0
+        self._last_input_chunk_at = 0.0
+        self._speaking_generation = 0
         self._shutdown_event = None
         self.ui_window = ui_window
         self._muted = False
@@ -475,6 +525,18 @@ class VisionLive:
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
             input_audio_transcription={},
             output_audio_transcription={},
+            # Tuned for a snappier feel: react to speech starting/stopping
+            # faster than the SDK defaults, while keeping enough padding/
+            # silence margin to avoid clipping the first phoneme or cutting
+            # someone off on a mid-sentence breath.
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=100,
+                    silence_duration_ms=500,
+                ),
+            ),
         )
         try:
             return types.LiveConnectConfig(enable_affective_dialog=True, **kwargs)
@@ -482,21 +544,47 @@ class VisionLive:
             print(f"[vision_live] Affective dialog not supported, continuing without it: {e}")
             return types.LiveConnectConfig(**kwargs)
 
-    async def _capture_and_queue_screen_frame(self):
+    async def _capture_and_queue_screen_frame(self, zoom_region=None):
         """Grabs one screen frame and sends it to the model via the realtime
-        video stream. Also records its pixel size so computer_control can
-        translate the model's click coordinates into real screen points.
-        Shared by the ambient _screen_share_loop and computer_control's
-        post-action "look" step."""
+        video stream. Also records its pixel size (and crop region, if any)
+        so computer_control can translate the model's click coordinates into
+        real screen points. Shared by the ambient _screen_share_loop and
+        computer_control's post-action "look" step.
+
+        If zoom_region is given (logical screen rect from
+        computer_control.compute_zoom_region), captures just that region
+        instead of the full screen and upscales it for legibility — lets the
+        model get a magnified close-up of a small target (e.g. a video
+        player's Skip Ad button) instead of guessing from a full desktop
+        screenshot."""
         with mss.mss() as sct:
-            screenshot = sct.grab(sct.monitors[1])
+            if zoom_region:
+                region = {
+                    "left": int(zoom_region["region_x"]), "top": int(zoom_region["region_y"]),
+                    "width": int(zoom_region["region_w"]), "height": int(zoom_region["region_h"]),
+                }
+                screenshot = sct.grab(region)
+            else:
+                screenshot = sct.grab(sct.monitors[1])
         img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-        img.thumbnail((1280, 1280))
+
+        if zoom_region:
+            scale = min(4, 1568 / max(img.width, img.height))
+            if scale > 1:
+                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        else:
+            img.thumbnail((1568, 1568))
+
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
         if self.out_queue:
             await self.out_queue.put({"data": buf.getvalue(), "mime_type": "image/jpeg"})
-        computer_control.record_capture_size(img.width, img.height)
+
+        if zoom_region:
+            region_tuple = (zoom_region["region_x"], zoom_region["region_y"], zoom_region["region_w"], zoom_region["region_h"])
+            computer_control.record_capture_size(img.width, img.height, region=region_tuple)
+        else:
+            computer_control.record_capture_size(img.width, img.height)
 
     async def _screen_share_loop(self):
         print("[vision_live] Screen sharing started.")
@@ -619,6 +707,13 @@ class VisionLive:
 
         confirmation_token = args.pop("confirmation_token", None)
         print(f"[vision_live] Tool call: {name}({args})")
+
+        if name == "execute_python" and confirmation_token:
+            # Only on the confirmed call that actually runs code — the first
+            # call (no token yet) just mints a confirmation request, which is
+            # near-instant and has nothing "slow" to cover with this cue.
+            asyncio.create_task(asyncio.to_thread(play_acoustic_cue, "waiting"))
+
         try:
             # NOTE: possessing a valid confirmation_token only proves this exact
             # pending action was offered by dispatch() moments ago — it does NOT
@@ -626,14 +721,26 @@ class VisionLive:
             # on the model faithfully following SYSTEM_PROMPT's confirm-before-
             # reuse instruction; the token closes off guessing/replay/naive
             # injection, not model misbehavior.
+            # Threaded so a slow tool (AppleScript, execute_python, computer_control)
+            # doesn't freeze the event loop — audio keeps flowing while it runs.
             if confirmation_token:
-                result = dispatcher.confirm(confirmation_token, approved=True)
+                result = await asyncio.to_thread(dispatcher.confirm, confirmation_token, approved=True)
             else:
-                result = dispatch(name, **args)
+                result = await asyncio.to_thread(dispatch, name, **args)
         except Exception as e:
             result = {"success": False, "error": str(e)}
             traceback.print_exc()
         print(f"[vision_live] Tool result: {result}")
+
+        # Excludes computer_control/start_computer_use/end_computer_use: those
+        # fire many times per GUI-automation task (or represent a state
+        # transition, not a discrete checkmark-able result) — chiming on
+        # every click/keystroke would be noise, not a helpful acknowledgment.
+        if name not in ("computer_control", "start_computer_use", "end_computer_use") and isinstance(result, dict):
+            if result.get("success") is True:
+                asyncio.create_task(asyncio.to_thread(play_acoustic_cue, "success"))
+            elif result.get("success") is False:
+                asyncio.create_task(asyncio.to_thread(play_acoustic_cue, "error"))
 
         if name == "web_search" and result.get("success"):
             self._set_ui_search_results(args.get("query", ""), result.get("results", []), result.get("images", []))
@@ -649,12 +756,20 @@ class VisionLive:
         if name == "computer_control":
             # Look-act-look: give the model a fresh view after every action,
             # regardless of whether the action itself succeeded, so it can
-            # see what actually happened (or why it didn't).
-            await self._capture_and_queue_screen_frame()
+            # see what actually happened (or why it didn't). A short settle
+            # delay first lets UI transitions/animations finish rather than
+            # capturing a mid-transition frame. If this was a zoom_screenshot
+            # request, capture that cropped region instead of the full screen.
+            await asyncio.sleep(0.5)
+            zoom_region = result.get("zoom_region") if isinstance(result, dict) else None
+            await self._capture_and_queue_screen_frame(zoom_region=zoom_region)
 
         if name == "start_computer_use" and result.get("status") != "confirmation_required" and result.get("success"):
             # Give the model an immediate first look once a task is confirmed,
-            # rather than making it call take_screenshot separately.
+            # rather than making it call take_screenshot separately. Longer
+            # settle delay since the target app may have just been opened
+            # and could still be rendering its window.
+            await asyncio.sleep(1.0)
             await self._capture_and_queue_screen_frame()
 
         return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
@@ -782,15 +897,19 @@ class VisionLive:
             msg = await self.out_queue.get()
             await self.session.send_realtime_input(media=msg)
 
-    async def _finish_speaking(self):
+    async def _finish_speaking(self, generation):
         while self.audio_in_queue and self.audio_in_queue.qsize() > 0:
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.6)
+        if generation != self._speaking_generation:
+            # A newer turn has already started speaking while this one was
+            # winding down — don't stomp its "speaking" state back to False.
+            return
         self._is_speaking = False
         self._last_active_time = time.time()
         self._set_ui_status("muted" if self._muted else "listening")
 
-    async def _handle_interruption(self):
+    async def _handle_interruption(self, out_buf=None):
         """Called when Gemini's server reports the user barged in mid-response."""
         print("[vision_live] User interrupted — stopping playback immediately.")
         # Drain any queued audio so playback stops right away
@@ -799,9 +918,33 @@ class VisionLive:
                 self.audio_in_queue.get_nowait()
             except Exception:
                 break
+
+        if out_buf:
+            partial = " ".join(out_buf).strip()
+            out_buf.clear()
+            if partial:
+                print(f"VISION (interrupted): {partial}")
+                save_message("assistant", f"[Interrupted by user] {partial}")
+
         self._is_speaking = False
         self._last_active_time = time.time()
         self._set_ui_status("listening")
+
+    async def _maybe_signal_processing(self, chunk_time):
+        """Debounced "user has likely finished talking" detector. There's no
+        explicit SDK event for this — input_transcription streams in
+        progressively while the user talks, and the only other signal we
+        have (output_transcription starting) is already too late to show a
+        "processing" state. So: wait a beat after each input chunk: if no
+        newer chunk has superseded this one and the model hasn't started
+        responding yet, assume they've stopped talking and are waiting on
+        VISION. Every chunk during continuous speech reschedules this and
+        the stale checks harmlessly no-op — only the one after the true
+        last chunk actually fires."""
+        await asyncio.sleep(0.35)
+        if self._last_input_chunk_at == chunk_time and not self._is_speaking:
+            self._set_ui_status("processing")
+            asyncio.create_task(asyncio.to_thread(play_acoustic_cue, "thinking"))
 
     async def _receive_audio(self):
         in_buf, out_buf = [], []
@@ -816,19 +959,22 @@ class VisionLive:
                     sc = response.server_content
 
                     if getattr(sc, "interrupted", False):
-                        asyncio.create_task(self._handle_interruption())
+                        asyncio.create_task(self._handle_interruption(out_buf))
 
                     if sc.input_transcription and sc.input_transcription.text:
                         in_buf.append(sc.input_transcription.text.strip())
+                        self._last_input_chunk_at = time.time()
+                        asyncio.create_task(self._maybe_signal_processing(self._last_input_chunk_at))
 
                     if sc.output_transcription and sc.output_transcription.text:
                         if not self._is_speaking:
                             self._set_ui_status("speaking")
                         self._is_speaking = True
+                        self._speaking_generation += 1
                         out_buf.append(sc.output_transcription.text.strip())
 
                     if sc.turn_complete:
-                        asyncio.create_task(self._finish_speaking())
+                        asyncio.create_task(self._finish_speaking(self._speaking_generation))
 
                         full_in = " ".join(in_buf).strip()
                         full_out = " ".join(out_buf).strip()
@@ -862,92 +1008,121 @@ class VisionLive:
             stream.stop()
             stream.close()
 
-    async def _watch_timeout(self):
-        while True:
-            await asyncio.sleep(1)
-            if self._active and not self._is_speaking and (time.time() - self._last_active_time > ACTIVE_TIMEOUT):
-                print("[vision_live] Silence timeout — going dormant.")
-                self._shutdown_event.set()
-                return
-
     async def _run_session(self, proactive_message: str = None):
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
-        live_config = self._build_config()
-
+        """Stays active for as long as the process is online. A crash or
+        dropped connection in any of the core tasks reconnects automatically
+        (showing "reconnecting") rather than falling back to dormant/idle —
+        only an explicit shutdown_vision call (self._shutdown_event) ends
+        the active session and returns control to the wake-word loop."""
         self._shutdown_event = asyncio.Event()
         self._active = True
         self._last_active_time = time.time()
+        greeted = False
 
-        self._headphones_mode = is_headphones_active()
-        print(f"[vision_live] Output device check — headphones mode: {self._headphones_mode}")
+        while True:
+            try:
+                client = genai.Client(api_key=config.GEMINI_API_KEY)
+                live_config = self._build_config()
 
-        print("[vision_live] Connecting to Gemini Live...")
+                self._headphones_mode = is_headphones_active()
+                print(f"[vision_live] Output device check — headphones mode: {self._headphones_mode}")
+                print("[vision_live] Connecting to Gemini Live...")
 
-        async with client.aio.live.connect(model=LIVE_MODEL, config=live_config) as session:
-            self.session = session
-            self.audio_in_queue = asyncio.Queue()
-            self.out_queue = asyncio.Queue(maxsize=10)
+                async with client.aio.live.connect(model=LIVE_MODEL, config=live_config) as session:
+                    self.session = session
+                    self.audio_in_queue = asyncio.Queue()
+                    self.out_queue = asyncio.Queue(maxsize=10)
 
-            print("[vision_live] Connected.")
-            self._set_ui_status("muted" if self._muted else "listening")
+                    print("[vision_live] Connected.")
+                    self._set_ui_status("muted" if self._muted else "listening")
 
-            history = get_recent_history(limit=10)
-            history_text = ""
-            if history:
-                history_text = "\n".join(
-                    f"{'User' if m['role'] == 'user' else 'VISION'}: {m['content']}"
-                    for m in history
-                )
+                    if not greeted:
+                        history = get_recent_history(limit=10)
+                        history_text = ""
+                        if history:
+                            history_text = "\n".join(
+                                f"{'User' if m['role'] == 'user' else 'VISION'}: {m['content']}"
+                                for m in history
+                            )
 
-            facts = get_all_facts()
-            facts_text = ""
-            if facts:
-                facts_text = "\n".join(f"- {f['key']}: {f['value']}" for f in facts)
+                        facts = get_all_facts()
+                        facts_text = ""
+                        if facts:
+                            facts_text = "\n".join(f"- {f['key']}: {f['value']}" for f in facts)
 
-            context_parts = ["[SYSTEM DIRECTIVE:"]
-            if facts_text:
-                context_parts.append(f"Known facts about {config.USER_NAME}:\n{facts_text}\n")
-            if history_text:
-                context_parts.append(f"Recent conversation history:\n{history_text}\n")
+                        context_parts = ["[SYSTEM DIRECTIVE:"]
+                        if facts_text:
+                            context_parts.append(f"Known facts about {config.USER_NAME}:\n{facts_text}\n")
+                        if history_text:
+                            context_parts.append(f"Recent conversation history:\n{history_text}\n")
 
-            if proactive_message:
-                context_parts.append(
-                    f"THIS CONVERSATION WAS STARTED BY YOU PROACTIVELY. "
-                    f"What you noticed: {proactive_message}\n"
-                    f"Naturally tell {config.USER_NAME} what you noticed, briefly, "
-                    f"then ask if they need anything. Do not mention this directive."
-                )
-            else:
-                context_parts.append(
-                    f"Greet {config.USER_NAME} warmly and briefly by name, referencing "
-                    f"recent context only if natural, then ask how you can help. "
-                    f"Do not mention this directive.]"
-                )
-            context_note = "\n".join(context_parts)
+                        if proactive_message:
+                            context_parts.append(
+                                f"THIS CONVERSATION WAS STARTED BY YOU PROACTIVELY. "
+                                f"What you noticed: {proactive_message}\n"
+                                f"Naturally tell {config.USER_NAME} what you noticed, briefly, "
+                                f"then ask if they need anything. Do not mention this directive."
+                            )
+                        else:
+                            context_parts.append(
+                                f"Greet {config.USER_NAME} warmly and briefly by name, referencing "
+                                f"recent context only if natural, then ask how you can help. "
+                                f"Do not mention this directive.]"
+                            )
+                        context_note = "\n".join(context_parts)
 
-            await session.send_client_content(
-                turns=types.Content(role="user", parts=[types.Part(text=context_note)]),
-                turn_complete=True,
-            )
+                        await session.send_client_content(
+                            turns=types.Content(role="user", parts=[types.Part(text=context_note)]),
+                            turn_complete=True,
+                        )
+                        greeted = True
 
-            tasks = [
-                asyncio.create_task(self._send_realtime()),
-                asyncio.create_task(self._listen_audio_awake()),
-                asyncio.create_task(self._receive_audio()),
-                asyncio.create_task(self._play_audio()),
-                asyncio.create_task(self._watch_timeout()),
-            ]
-            shutdown_task = asyncio.create_task(self._shutdown_event.wait())
+                    tasks = [
+                        asyncio.create_task(self._send_realtime()),
+                        asyncio.create_task(self._listen_audio_awake()),
+                        asyncio.create_task(self._receive_audio()),
+                        asyncio.create_task(self._play_audio()),
+                    ]
+                    shutdown_task = asyncio.create_task(self._shutdown_event.wait())
 
-            await asyncio.wait([shutdown_task, *tasks], return_when=asyncio.FIRST_COMPLETED)
-            await asyncio.sleep(SHUTDOWN_GRACE_PERIOD)
+                    done, _ = await asyncio.wait([shutdown_task, *tasks], return_when=asyncio.FIRST_COMPLETED)
 
-            self._stop_screen_share()
-            self._stop_camera()
+                    for t in tasks:
+                        t.cancel()
+                    shutdown_task.cancel()
+                    # .cancel() only requests cancellation — without awaiting,
+                    # a straggler task (e.g. still holding the mic InputStream
+                    # open) can keep running into the next reconnect iteration
+                    # and collide with the new session's queues.
+                    await asyncio.gather(*tasks, shutdown_task, return_exceptions=True)
 
-            for t in tasks:
-                t.cancel()
-            shutdown_task.cancel()
+                    if self._shutdown_event.is_set():
+                        await asyncio.sleep(SHUTDOWN_GRACE_PERIOD)
+                        self._stop_screen_share()
+                        self._stop_camera()
+                        break
+
+                    # One of the core tasks ended unexpectedly — surface why
+                    # (asyncio.wait swallows task exceptions silently unless
+                    # explicitly checked) and reconnect instead of going dormant.
+                    for t in done:
+                        if t is shutdown_task or t.cancelled():
+                            continue
+                        exc = t.exception()
+                        if exc:
+                            print(f"[vision_live] A core task ended unexpectedly: {exc!r}")
+                            traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+            except Exception as e:
+                print(f"[vision_live] Session error: {e}")
+                traceback.print_exc()
+
+            if self._shutdown_event.is_set():
+                break
+
+            print("[vision_live] Connection lost — reconnecting while staying active...")
+            self._set_ui_status("reconnecting")
+            await asyncio.sleep(2)
 
         self._active = False
         self.session = None

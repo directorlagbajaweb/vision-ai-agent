@@ -54,29 +54,21 @@ def run_with_tools(messages: list[dict], model_chain: list[str]) -> dict:
         name = tool_call.function.name
         arguments = json.loads(tool_call.function.arguments)
 
-        if pending_confirmation is not None:
-            # An earlier tool call in this same turn already needs confirmation;
-            # only one confirmation can surface per turn, so skip executing any
-            # remaining calls but still reply to every tool_call_id.
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps({
-                    "success": False,
-                    "skipped": True,
-                    "reason": "Skipped pending confirmation of an earlier action this turn.",
-                }),
-            })
-            continue
-
         dispatch_result = execute_tool_call(name, arguments)
 
         if dispatch_result.get("status") == "confirmation_required":
-            pending_confirmation = {
-                "action": dispatch_result["action"],
-                "confirmation_token": dispatch_result["confirmation_token"],
-                "prompt": dispatch_result["prompt"],
-            }
+            if pending_confirmation is None:
+                # Only one confirmation can be surfaced to the caller per
+                # turn — the first one found wins. A second gated call still
+                # runs through dispatch() (minting its own token, which just
+                # expires unused via the existing TTL) and its real prompt is
+                # still recorded in message history, but re-asking is needed
+                # to actually confirm it.
+                pending_confirmation = {
+                    "action": dispatch_result["action"],
+                    "confirmation_token": dispatch_result["confirmation_token"],
+                    "prompt": dispatch_result["prompt"],
+                }
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,

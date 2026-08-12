@@ -39,7 +39,7 @@ ACTION_REGISTRY = {
     "search_files": {"function": file_tools.search_files, "requires_confirmation": False},
     "web_search": {"function": web_search_module.web_search, "requires_confirmation": False},
     "execute_python": {"function": code_exec.execute_python, "requires_confirmation": True},
-    "start_computer_use": {"function": computer_control.start_session, "requires_confirmation": True},
+    "start_computer_use": {"function": computer_control.start_session, "requires_confirmation": computer_control.needs_confirmation_for_start},
     "computer_control": {"function": computer_control.execute, "requires_confirmation": False},
     "end_computer_use": {"function": computer_control.end_session, "requires_confirmation": False},
 }
@@ -62,8 +62,11 @@ def dispatch(action_name: str, **kwargs) -> dict:
         return {"success": False, "error": f"Unknown action: {action_name}"}
 
     entry = ACTION_REGISTRY[action_name]
+    requires_confirmation = entry["requires_confirmation"]
+    if callable(requires_confirmation):
+        requires_confirmation = requires_confirmation(**kwargs)
 
-    if entry["requires_confirmation"]:
+    if requires_confirmation:
         token = secrets.token_urlsafe(16)
         _pending_confirmations[token] = {
             "action": action_name,

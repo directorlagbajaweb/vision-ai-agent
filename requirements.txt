@@ -19,3 +19,8 @@ opencv-python
 chromadb
 sentence-transformers
 tavily-python
+numpy
+
+# macOS GUI automation (system_control/computer_control.py)
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
