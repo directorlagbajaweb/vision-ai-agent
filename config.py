@@ -48,9 +48,6 @@ EVERYDAY_MODEL_CHAIN = [
 WAKE_WORD = "vision"          # phrase VISION listens for
 WAKE_WORD_SENSITIVITY = 0.5   # 0.0 (strict) to 1.0 (loose)
 
-# ── Voice Output ──────────────────────────────────────
-TTS_ENGINE = "say"            # "say" (free, built-in) or "elevenlabs" (paid, natural)
-
 # ── App Behavior ──────────────────────────────────────
 MAX_FALLBACK_ATTEMPTS = 3     # how many models to try before giving up
 REQUEST_TIMEOUT_SECONDS = 30  # per-model timeout before falling back
