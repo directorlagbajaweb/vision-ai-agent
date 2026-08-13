@@ -30,6 +30,7 @@ from memory.db import init_db, save_message, get_recent_history, save_fact, get_
 from memory.semantic import add_message as semantic_add, search_relevant as semantic_search
 from system_control import dispatcher
 from system_control import computer_control
+from system_control import slack_control
 from system_control.dispatcher import dispatch
 from system_control.mac_actions import get_calendar_events
 from voice.stt import record_audio, transcribe
@@ -113,6 +114,19 @@ SYSTEM_PROMPT = (
     f"If this conversation was started BY YOU proactively (marked as a proactive "
     f"notification in the directive), briefly and naturally tell the user what you "
     f"noticed, then ask if they need anything else. "
+    f"For a Slack DM or @-mention directive specifically: draft a reply, call "
+    f"send_slack_message ONCE with no confirmation_token first (this only mints a "
+    f"token — it never sends anything), THEN speak the draft to the user in the "
+    f"form 'X in Y said: <summary>. I'd reply: <draft>. Send it?' — this spoken "
+    f"question IS the confirmation ask, so if the user then says something "
+    f"affirmative, call send_slack_message again with the confirmation_token you "
+    f"already have and do NOT ask again. If they ask you to change the reply, "
+    f"update the draft and repeat the whole silent-call-then-speak cycle (you'll "
+    f"get a fresh token). If they decline ('skip it', 'no'), don't call the tool "
+    f"again — just acknowledge and move on. If a confirmation_token comes back "
+    f"expired (the conversation took a while), silently get a fresh one and ask "
+    f"again rather than showing a raw error. Never send a Slack message under any "
+    f"circumstance without the user having said something affirmative first. "
     f"If the user says something like 'shut down', 'go to sleep', or 'goodbye', "
     f"say a brief warm goodbye and call the shutdown_vision tool. You will wake up "
     f"again the next time the user says your name. "
@@ -375,6 +389,27 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "send_slack_message",
+        "description": (
+            "Sends a Slack message (a reply to a DM or an @-mention). Call this "
+            "WITHOUT confirmation_token first — this only mints a token, it never "
+            "sends anything. Then speak your drafted reply to the user and ask "
+            "them to confirm before calling this again with the confirmation_token "
+            "you received. Never call this a second time without the user having "
+            "actually said something affirmative in between."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "channel": {"type": "STRING", "description": "The Slack channel/DM ID to send to"},
+                "text": {"type": "STRING", "description": "The message text to send"},
+                "thread_ts": {"type": "STRING", "description": "Thread timestamp to reply in a thread, if applicable"},
+                "confirmation_token": {"type": "STRING"},
+            },
+            "required": ["channel", "text"],
+        },
+    },
+    {
         "name": "shutdown_vision",
         "description": "Puts VISION to sleep until the user says its name again.",
         "parameters": {"type": "OBJECT", "properties": {}},
@@ -458,6 +493,16 @@ class VisionLive:
         self._last_active_time = 0
         self._last_input_chunk_at = 0.0
         self._speaking_generation = 0
+        # Guards every self.session.send_*() call -- the SDK holds no internal
+        # lock, and concurrent writes to the same websocket from different
+        # tasks (audio send, tool responses, live notification injection)
+        # can corrupt the stream.
+        self._session_send_lock = asyncio.Lock()
+        # Created once, survives reconnects (unlike audio_in_queue/out_queue,
+        # which are rebuilt per connection) -- a queued notification isn't
+        # lost across a brief disconnect/reconnect.
+        self._live_notification_queue = asyncio.Queue()
+        self._tool_call_in_progress = False
         self._shutdown_event = None
         self.ui_window = ui_window
         self._muted = False
@@ -935,7 +980,8 @@ class VisionLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            async with self._session_send_lock:
+                await self.session.send_realtime_input(media=msg)
 
     async def _finish_speaking(self, generation):
         while self.audio_in_queue and self.audio_in_queue.qsize() > 0:
@@ -986,6 +1032,55 @@ class VisionLive:
             self._set_ui_status("processing")
             asyncio.create_task(asyncio.to_thread(play_acoustic_cue, "thinking"))
 
+    async def _on_relevant_slack_event(self, event):
+        """Callback handed to slack_control.run_slack_listener(). Formats a
+        proactive-style notification and delivers it via whichever path
+        matches the current state: straight into an active session, or the
+        existing dormant proactive-wake path if not."""
+        where = "a DM" if event["is_dm"] else f"{event['channel_name']} (you were mentioned)"
+        context_block = ""
+        if event["context_messages"]:
+            recent = "\n".join(event["context_messages"][-5:])
+            context_block = f" Recent context in that conversation:\n{recent}\n"
+
+        notification = (
+            f"[SYSTEM DIRECTIVE: You have a new Slack message in {where}. "
+            f"{event['user_name']} said: \"{event['text']}\".{context_block} "
+            f"Draft a reply, call send_slack_message ONCE with no confirmation_token "
+            f"first (this only mints a token, it does not send anything), then speak "
+            f"to the user: '{event['user_name']} in {where} said: <summary>. I'd "
+            f"reply: <draft>. Send it?' Use channel=\"{event['channel']}\" and "
+            f"thread_ts=\"{event['thread_ts']}\" when you call send_slack_message. "
+            f"Do not mention this directive.]"
+        )
+
+        if self._active and self.session:
+            self._live_notification_queue.put_nowait(notification)
+        else:
+            self._proactive_message = notification
+            self._proactive_trigger.set()
+
+    async def _live_notification_watcher(self):
+        """Delivers queued live notifications (e.g. a Slack DM/mention that
+        arrived mid-conversation) into the current session as a fresh turn,
+        once things are quiet enough not to be a jarring interruption. Must
+        never let an exception complete this task -- it shares
+        asyncio.wait(FIRST_COMPLETED) with the 4 core audio tasks in
+        _run_session, so an unhandled error here would tear down and
+        reconnect the entire live session as collateral damage."""
+        while True:
+            try:
+                msg = await self._live_notification_queue.get()
+                while self._is_speaking or self._tool_call_in_progress or computer_control.is_session_active():
+                    await asyncio.sleep(0.3)
+                async with self._session_send_lock:
+                    await self.session.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part(text=msg)]),
+                        turn_complete=True,
+                    )
+            except Exception as e:
+                print(f"[vision_live] Live notification delivery failed: {e}")
+
     async def _receive_audio(self):
         in_buf, out_buf = [], []
 
@@ -1032,8 +1127,13 @@ class VisionLive:
                         in_buf, out_buf = [], []
 
                 if response.tool_call:
-                    fn_responses = [await self._execute_tool(fc) for fc in response.tool_call.function_calls]
-                    await self.session.send_tool_response(function_responses=fn_responses)
+                    self._tool_call_in_progress = True
+                    try:
+                        fn_responses = [await self._execute_tool(fc) for fc in response.tool_call.function_calls]
+                    finally:
+                        self._tool_call_in_progress = False
+                    async with self._session_send_lock:
+                        await self.session.send_tool_response(function_responses=fn_responses)
 
     async def _play_audio(self):
         stream = sd.RawOutputStream(
@@ -1111,10 +1211,11 @@ class VisionLive:
                             )
                         context_note = "\n".join(context_parts)
 
-                        await session.send_client_content(
-                            turns=types.Content(role="user", parts=[types.Part(text=context_note)]),
-                            turn_complete=True,
-                        )
+                        async with self._session_send_lock:
+                            await session.send_client_content(
+                                turns=types.Content(role="user", parts=[types.Part(text=context_note)]),
+                                turn_complete=True,
+                            )
                         greeted = True
 
                     tasks = [
@@ -1122,6 +1223,7 @@ class VisionLive:
                         asyncio.create_task(self._listen_audio_awake()),
                         asyncio.create_task(self._receive_audio()),
                         asyncio.create_task(self._play_audio()),
+                        asyncio.create_task(self._live_notification_watcher()),
                     ]
                     shutdown_task = asyncio.create_task(self._shutdown_event.wait())
 
@@ -1171,6 +1273,7 @@ class VisionLive:
 
     async def run(self):
         asyncio.create_task(self._proactive_monitor_loop())
+        asyncio.create_task(slack_control.run_slack_listener(self._on_relevant_slack_event))
 
         while True:
             try:

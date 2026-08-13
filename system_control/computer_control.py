@@ -278,6 +278,13 @@ def end_session() -> dict:
     return {"success": True, "ended": had_session}
 
 
+def is_session_active() -> bool:
+    """Lets other modules (e.g. vision_live.py's live-notification gating)
+    check whether a computer-use task is in progress without reaching into
+    this module's internal state directly."""
+    return _active_session is not None
+
+
 def execute(action: str, x=None, y=None, text: str = None, key: str = None, direction: str = None, amount: int = None) -> dict:
     """Single entry point for all computer_control tool calls."""
     if _active_session is None:

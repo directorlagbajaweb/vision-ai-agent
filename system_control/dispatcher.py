@@ -17,6 +17,7 @@ from system_control import web_search as web_search_module
 from system_control import code_exec
 from system_control import computer_control
 from system_control import spotify_control
+from system_control import slack_control
 
 CONFIRMATION_TTL_SECONDS = 120
 
@@ -47,6 +48,7 @@ ACTION_REGISTRY = {
     "pause_spotify": {"function": spotify_control.pause_spotify, "requires_confirmation": False},
     "resume_spotify": {"function": spotify_control.resume_spotify, "requires_confirmation": False},
     "next_spotify_track": {"function": spotify_control.next_spotify_track, "requires_confirmation": False},
+    "send_slack_message": {"function": slack_control.send_slack_message, "requires_confirmation": True},
 }
 
 
@@ -59,6 +61,8 @@ def describe_action(action_name: str, **kwargs) -> str:
         return "Run this code on your Mac?"
     if action_name == "start_computer_use":
         return f"Let VISION control your screen to: {kwargs.get('goal', 'do something')}?"
+    if action_name == "send_slack_message":
+        return f"Send this Slack message: \"{kwargs.get('text', '')}\"?"
     return f"Proceed with {action_name}?"
 
 

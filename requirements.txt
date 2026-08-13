@@ -23,3 +23,6 @@ numpy
 # macOS GUI automation (system_control/computer_control.py)
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz
+
+# Slack integration (system_control/slack_control.py)
+slack_sdk

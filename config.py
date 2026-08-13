@@ -24,6 +24,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SLACK_USER_TOKEN = os.getenv("SLACK_USER_TOKEN")
+SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
+SLACK_USER_ID = os.getenv("SLACK_USER_ID")
 
 # ── OpenRouter Settings ───────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
