@@ -66,6 +66,14 @@ SYSTEM_PROMPT = (
     f"For close_app and run_shortcut specifically: call the tool first; if it "
     f"returns a confirmation_token, ask the user to confirm out loud, then call "
     f"the tool again passing that same confirmation_token only after they say yes. "
+    f"Whenever a dedicated tool exists for what you're being asked to do, use it "
+    f"instead of computer_control — never fall back to generic mouse/keyboard "
+    f"control (screen-reading and clicking) for something a dedicated tool already "
+    f"handles. Spotify is the clear example: to play/pause/resume/skip a track, call "
+    f"play_spotify_track/pause_spotify/resume_spotify/next_spotify_track directly — "
+    f"do not open a computer-use session to click through Spotify's UI for these, "
+    f"it's far less reliable than the dedicated tools. Only reach for computer_control "
+    f"when no dedicated tool covers the specific app/action being asked for. "
     f"Whenever you write or provide code, ALWAYS call the show_code tool with the "
     f"code instead of speaking it aloud — just give a brief spoken summary of what "
     f"it does. "
@@ -164,6 +172,38 @@ TOOL_DECLARATIONS = [
         "name": "open_app",
         "description": "Opens or brings focus to a macOS application.",
         "parameters": {"type": "OBJECT", "properties": {"app_name": {"type": "STRING"}}, "required": ["app_name"]},
+    },
+    {
+        "name": "play_spotify_track",
+        "description": (
+            "Searches Spotify's catalog for a track and plays it in the Spotify app. "
+            "Use this whenever asked to play a specific song/artist on Spotify — it's "
+            "far more reliable than clicking through Spotify's UI with computer_control. "
+            "Verifies Spotify actually started playing before reporting success; if it "
+            "returns success: false, the error explains exactly what went wrong "
+            "(no track found, the command failed, or playback didn't actually start) "
+            "so you can tell the user accurately."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"query": {"type": "STRING", "description": "Song name and artist if known, e.g. 'Blinding Lights The Weeknd'"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "pause_spotify",
+        "description": "Pauses Spotify playback. Verifies it actually paused before reporting success.",
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "resume_spotify",
+        "description": "Resumes/unpauses Spotify playback. Verifies it actually resumed before reporting success.",
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "next_spotify_track",
+        "description": "Skips to the next track in Spotify. Verifies playback is in a real state afterward before reporting success.",
+        "parameters": {"type": "OBJECT", "properties": {}},
     },
     {
         "name": "close_app",

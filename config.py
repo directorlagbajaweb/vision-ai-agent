@@ -22,6 +22,8 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")   # optional, added later
 PORCUPINE_API_KEY = os.getenv("PORCUPINE_API_KEY")     # optional, added later
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 # ── OpenRouter Settings ───────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"

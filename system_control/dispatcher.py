@@ -16,6 +16,7 @@ from system_control import file_tools
 from system_control import web_search as web_search_module
 from system_control import code_exec
 from system_control import computer_control
+from system_control import spotify_control
 
 CONFIRMATION_TTL_SECONDS = 120
 
@@ -42,6 +43,10 @@ ACTION_REGISTRY = {
     "start_computer_use": {"function": computer_control.start_session, "requires_confirmation": computer_control.needs_confirmation_for_start},
     "computer_control": {"function": computer_control.execute, "requires_confirmation": False},
     "end_computer_use": {"function": computer_control.end_session, "requires_confirmation": False},
+    "play_spotify_track": {"function": spotify_control.play_spotify_track, "requires_confirmation": False},
+    "pause_spotify": {"function": spotify_control.pause_spotify, "requires_confirmation": False},
+    "resume_spotify": {"function": spotify_control.resume_spotify, "requires_confirmation": False},
+    "next_spotify_track": {"function": spotify_control.next_spotify_track, "requires_confirmation": False},
 }
 
 
