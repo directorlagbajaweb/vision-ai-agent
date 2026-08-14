@@ -12,8 +12,11 @@ import sys
 import io
 import time
 import json
+import wave
 import asyncio
+import tempfile
 import traceback
+import subprocess
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -45,6 +48,11 @@ CHUNK_SIZE = 1024
 WAKE_PHRASE = config.WAKE_WORD.lower()
 WAKE_CHUNK_DURATION = 3.0
 SHUTDOWN_GRACE_PERIOD = 2.0
+
+# How long the mic can go idle (no real user speech, no VISION speaking)
+# before forwarding to Gemini Live auto-pauses. This does NOT end the
+# session or close the connection -- see set_muted()/_muted_auto below.
+AUTO_MUTE_IDLE_SECONDS = 75
 SCREEN_CAPTURE_INTERVAL = 2.0
 CAMERA_CAPTURE_INTERVAL = 2.0
 
@@ -67,14 +75,18 @@ SYSTEM_PROMPT = (
     f"For close_app and run_shortcut specifically: call the tool first; if it "
     f"returns a confirmation_token, ask the user to confirm out loud, then call "
     f"the tool again passing that same confirmation_token only after they say yes. "
-    f"Whenever a dedicated tool exists for what you're being asked to do, use it "
-    f"instead of computer_control — never fall back to generic mouse/keyboard "
-    f"control (screen-reading and clicking) for something a dedicated tool already "
-    f"handles. Spotify is the clear example: to play/pause/resume/skip a track, call "
-    f"play_spotify_track/pause_spotify/resume_spotify/next_spotify_track directly — "
-    f"do not open a computer-use session to click through Spotify's UI for these, "
-    f"it's far less reliable than the dedicated tools. Only reach for computer_control "
-    f"when no dedicated tool covers the specific app/action being asked for. "
+    f"Whenever a dedicated tool exists for what you're being asked to do, use it — "
+    f"Spotify is the clear example: to play/pause/resume/skip a track, call "
+    f"play_spotify_track/pause_spotify/resume_spotify/next_spotify_track directly. "
+    f"For generic 'pause this'/'play this'/'skip this' where the target isn't "
+    f"specifically Spotify (a YouTube video, something in Safari, Prime Video, etc.), "
+    f"call toggle_media_playback/next_media_track/previous_media_track — these send "
+    f"a real hardware media-key press and work regardless of what has focus, but "
+    f"cannot verify what actually happened, so say something like 'I sent play/pause' "
+    f"rather than claiming to know it's now playing. If NO dedicated tool exists for "
+    f"a requested action, tell the user honestly that you can't do that yet — do not "
+    f"attempt to click through an app's UI or read the screen to work around it; that "
+    f"capability has been intentionally disabled as unreliable. "
     f"Whenever you write or provide code, ALWAYS call the show_code tool with the "
     f"code instead of speaking it aloud — just give a brief spoken summary of what "
     f"it does. "
@@ -130,55 +142,17 @@ SYSTEM_PROMPT = (
     f"If the user says something like 'shut down', 'go to sleep', or 'goodbye', "
     f"say a brief warm goodbye and call the shutdown_vision tool. You will wake up "
     f"again the next time the user says your name. "
-    f"When the user asks you to complete a task by directly using their screen — "
-    f"opening an app, clicking something, searching within an app, filling in a "
-    f"field, playing a song, and similar multi-step actions — call start_computer_use "
-    f"with a short description of the goal. Prefer the most reliable path to the "
-    f"goal, not the most literal one: for anything that involves finding or opening "
-    f"a specific real thing on a website (a video, a song, an article), first use "
-    f"web_search to find a concrete, real URL for it, then call open_url with that "
-    f"exact URL to navigate straight there — this is far more reliable than opening "
-    f"a blank browser and clicking around hoping to find it. Only fall back to "
-    f"clicking around a site's own UI (via computer_control, after open_url got you "
-    f"there) for things a URL can't do — pressing play if it doesn't autoplay, "
-    f"skipping an ad, searching within the site itself. Once confirmed, you'll get a "
-    f"screenshot automatically; from then on, repeat: look at the most recent "
-    f"screenshot, decide "
-    f"one next action, call computer_control with exactly one action (mouse_move, "
-    f"left_click, double_click, right_click, scroll, type_text, press_key, "
-    f"take_screenshot, or zoom_screenshot), then look "
-    f"at the new screenshot you're sent before deciding the next one. Keep going on "
-    f"your own without asking the user again after each step — only speak up if you're "
-    f"stuck, need information only they have, or the task looks done. Call "
-    f"take_screenshot if you're ever unsure what's currently on screen — including right "
-    f"after a click, if the screen still looks like it's mid-transition or loading. "
-    f"Small on-screen targets are the hardest thing for you to click precisely, so prefer "
-    f"a keyboard shortcut over a pixel-precise click whenever one exists for what you're "
-    f"trying to do (e.g. space to play/pause media, arrow keys to navigate, enter to "
-    f"activate a focused/default button, cmd+f to find something instead of hunting for "
-    f"a search icon). When you do have to click something small or you're not confident "
-    f"exactly where it is (a Skip Ad button, a small icon), call zoom_screenshot with "
-    f"your best-guess x,y first — you'll get a magnified close-up, and your next "
-    f"coordinates should be given relative to THAT zoomed image, not the original. For "
-    f"anything genuinely important, you can also mouse_move to your best guess, "
-    f"take_screenshot, and visually check whether the cursor actually landed on the "
-    f"target before committing to left_click — the cursor itself is visible in "
-    f"screenshots, so use it to confirm your aim, adjusting with another mouse_move if "
-    f"it's off. Video players and many web UIs hide their controls (play/pause, "
-    f"progress bar, Skip Ad) until the mouse moves over the content — if expected "
-    f"controls aren't visible, mouse_move over the video/content area first, then "
-    f"take_screenshot again before deciding your next click. When you do have to click "
-    f"a plain target, aim for the visual center and prefer larger, unambiguous elements "
-    f"(a labeled button or menu item) over small icons when both accomplish the same "
-    f"thing. Be accurate about what actually happened: never tell the user something "
-    f"is playing, done, or worked unless you can actually see the evidence of it in "
-    f"your most recent screenshot (a video's paused/playing controls, a progress bar "
-    f"that has moved, the specific page you meant to reach) — if you're not sure, "
-    f"take another screenshot and check before saying anything. If several attempts "
-    f"at something aren't working, say so honestly and ask the user rather than "
-    f"claiming it worked. When the goal is complete, or you're told you've hit the "
-    f"step limit, call end_computer_use and briefly tell the user what actually "
-    f"happened, including if it didn't fully work."
+    f"When the user asks you to find or open something specific on a website (a "
+    f"video, a song, an article), use web_search to find a concrete, real URL, then "
+    f"call open_url with that exact URL to navigate straight there. If playback "
+    f"doesn't start on its own once there, use toggle_media_playback to send the "
+    f"play key. Be accurate about what actually happened — never claim something is "
+    f"playing or done unless you have real evidence of it (a tool's own confirmed "
+    f"result, like Spotify's player-state check); for the media-key tools "
+    f"specifically, say you sent the key rather than claiming to know the outcome. "
+    f"VISION cannot click through an app's interface or read the screen to find "
+    f"something to click — if a user's request would need that and no dedicated "
+    f"tool covers it, say so honestly rather than attempting it."
 )
 
 TOOL_DECLARATIONS = [
@@ -191,8 +165,7 @@ TOOL_DECLARATIONS = [
         "name": "play_spotify_track",
         "description": (
             "Searches Spotify's catalog for a track and plays it in the Spotify app. "
-            "Use this whenever asked to play a specific song/artist on Spotify — it's "
-            "far more reliable than clicking through Spotify's UI with computer_control. "
+            "Use this whenever asked to play a specific song/artist on Spotify. "
             "Verifies Spotify actually started playing before reporting success; if it "
             "returns success: false, the error explains exactly what went wrong "
             "(no track found, the command failed, or playback didn't actually start) "
@@ -277,9 +250,8 @@ TOOL_DECLARATIONS = [
             "and interact with it — use this ONLY for a page YOU wrote yourself (a "
             "landing page, a demo, code you were asked to preview). NEVER use this "
             "to try to show a real external website (YouTube, a news site, anything "
-            "with a real URL) — it can't load real external content. To interact "
-            "with a real website, use start_computer_use/computer_control on an "
-            "actual browser instead."
+            "with a real URL) — it can't load real external content. To open a real "
+            "website, use open_url instead."
         ),
         "parameters": {"type": "OBJECT", "properties": {"html": {"type": "STRING"}}, "required": ["html"]},
     },
@@ -410,62 +382,60 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "slack_catch_me_up",
+        "description": (
+            "Read-only Slack lookup: summarizes recent history for a channel or a "
+            "person's DM out loud. Use for things like 'catch me up on #general', "
+            "'what did Sarah and I talk about yesterday', 'summarize the design "
+            "channel from this week'. Never sends or posts anything — separate from "
+            "and unrelated to send_slack_message. If the result has "
+            "needs_clarification: true, don't guess — ask the user which channel or "
+            "person they meant, using the error message as a guide, then call this "
+            "again with a more specific channel_or_person."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "channel_or_person": {
+                    "type": "STRING",
+                    "description": "A channel name (e.g. 'general', '#design') or a person's name (e.g. 'Sarah') to look up.",
+                },
+                "time_range": {
+                    "type": "STRING",
+                    "description": "How far back to look, loosely parsed: 'today', 'yesterday', 'this week'. Defaults to the last 24 hours if omitted or unrecognized.",
+                },
+            },
+            "required": ["channel_or_person"],
+        },
+    },
+    {
         "name": "shutdown_vision",
         "description": "Puts VISION to sleep until the user says its name again.",
         "parameters": {"type": "OBJECT", "properties": {}},
     },
     {
-        "name": "start_computer_use",
+        "name": "toggle_media_playback",
         "description": (
-            "Starts an autonomous GUI-automation task where VISION directly controls "
-            "the mouse and keyboard to complete a multi-step goal (e.g. 'open Spotify, "
-            "search for a song, and play it'). Call this WITHOUT confirmation_token first; "
-            "if the result has status 'confirmation_required', ask the user to confirm "
-            "out loud, then call this tool again passing the confirmation_token value "
-            "you received. Once confirmed, use the computer_control tool to act."
+            "Sends the hardware Play/Pause media key — works regardless of which "
+            "app or website currently has focus (YouTube in a browser, Safari, Prime "
+            "Video, etc.), the same way a physical keyboard's Play/Pause key would. "
+            "Use this for generic 'pause this'/'play this'/'pause the video' requests "
+            "where no more specific dedicated tool applies (e.g. prefer the Spotify "
+            "tools for Spotify specifically). This does NOT click anything on screen "
+            "and cannot verify whether it actually started or stopped playing — only "
+            "that the key press was sent. Say so honestly rather than claiming to "
+            "know the result."
         ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "goal": {"type": "STRING", "description": "Short description of what you're trying to accomplish"},
-                "confirmation_token": {"type": "STRING"},
-            },
-            "required": ["goal"],
-        },
+        "parameters": {"type": "OBJECT", "properties": {}},
     },
     {
-        "name": "computer_control",
-        "description": (
-            "Performs one GUI action as part of an active computer-use task (see "
-            "start_computer_use) — moving/clicking/right-clicking/scrolling, typing "
-            "text, pressing a key, taking a screenshot, or zooming in on a region. "
-            "After every call, a fresh screenshot is sent to you automatically — look "
-            "at it before deciding your next action. Coordinates are pixel positions "
-            "within that most recent screenshot (the zoomed-in one, if your last call "
-            "was zoom_screenshot — not the original full screen). Keep calling this "
-            "one action at a time, autonomously, until the goal is done or you're told "
-            "the step limit was reached."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {
-                    "type": "STRING",
-                    "description": "One of: mouse_move, left_click, double_click, right_click, scroll, type_text, press_key, take_screenshot, zoom_screenshot",
-                },
-                "x": {"type": "INTEGER", "description": "X coordinate in the last screenshot, for mouse_move/left_click/double_click/right_click/zoom_screenshot"},
-                "y": {"type": "INTEGER", "description": "Y coordinate in the last screenshot, for mouse_move/left_click/double_click/right_click/zoom_screenshot"},
-                "text": {"type": "STRING", "description": "Text to type, for type_text"},
-                "key": {"type": "STRING", "description": "Key to press, for press_key, e.g. 'enter', 'tab', 'cmd+a'"},
-                "direction": {"type": "STRING", "description": "One of: up, down, left, right — for scroll"},
-                "amount": {"type": "INTEGER", "description": "For scroll, lines to scroll (default 3). For zoom_screenshot, half-width in pixels of the region to zoom into around x,y (default 200 — smaller means more magnified)"},
-            },
-            "required": ["action"],
-        },
+        "name": "next_media_track",
+        "description": "Sends the hardware Next-track media key. Same focus-independent behavior and same honesty caveat as toggle_media_playback — can't verify the result.",
+        "parameters": {"type": "OBJECT", "properties": {}},
     },
     {
-        "name": "end_computer_use",
-        "description": "Ends the current computer-use task. Call this once the goal is complete (or you need to give up and explain why) before speaking to the user again.",
+        "name": "previous_media_track",
+        "description": "Sends the hardware Previous-track media key. Same focus-independent behavior and same honesty caveat as toggle_media_playback — can't verify the result.",
         "parameters": {"type": "OBJECT", "properties": {}},
     },
 ]
@@ -505,7 +475,9 @@ class VisionLive:
         self._tool_call_in_progress = False
         self._shutdown_event = None
         self.ui_window = ui_window
-        self._muted = False
+        self._muted = False           # manual mute (explicit "mute"/unmute button) -- only lifts on explicit unmute
+        self._muted_auto = False      # auto-mute from inactivity -- lifts automatically on wake-word detection
+        self._auto_mute_audio_buffer = bytearray()
         self._screen_active = False
         self._screen_task = None
         self._camera_active = False
@@ -594,14 +566,60 @@ class VisionLive:
                 pass
 
     def set_muted(self, muted: bool):
+        """Manual mute (explicit 'mute'/unmute button) -- fully independent of
+        auto-mute. Engaging it supersedes and clears any active auto-mute;
+        disengaging it resets the idle clock so it doesn't immediately
+        re-auto-mute using a stale _last_active_time from before the mute."""
         self._muted = muted
+        if muted:
+            self._muted_auto = False
+            self._auto_mute_audio_buffer.clear()
+        else:
+            self._last_active_time = time.time()
         print(f"[vision_live] Mute set to: {muted}")
-        if self.ui_window:
-            try:
-                state = "muted" if muted else ("listening" if self._active else "idle")
-                self.ui_window.evaluate_js(f"window.updateStatus && window.updateStatus('{state}')")
-            except Exception:
-                pass
+        state = "muted" if muted else ("listening" if self._active else "idle")
+        self._set_ui_status(state)
+
+    def _play_system_sound(self, name: str):
+        """Short native macOS system sounds for auto-mute events -- deliberately
+        NOT the synthesized acoustic_cues tones, per an explicit ask for simple
+        built-in system sounds here."""
+        sound_files = {
+            "auto_mute": "/System/Library/Sounds/Tink.aiff",
+            "auto_unmute": "/System/Library/Sounds/Glass.aiff",
+        }
+        path = sound_files.get(name)
+        if not path:
+            return
+        try:
+            subprocess.run(["afplay", path], check=False, timeout=5)
+        except Exception as e:
+            print(f"[vision_live] Failed to play system sound '{name}': {e}")
+
+    def _engage_auto_mute(self):
+        self._muted_auto = True
+        print(f"[vision_live] Auto-muted after {AUTO_MUTE_IDLE_SECONDS}s of inactivity (connection stays open).")
+        self._set_ui_status("muted")
+        asyncio.create_task(asyncio.to_thread(self._play_system_sound, "auto_mute"))
+
+    def _disengage_auto_mute(self):
+        self._muted_auto = False
+        self._last_active_time = time.time()
+        print("[vision_live] Wake phrase heard while auto-muted -- resuming.")
+        self._set_ui_status("listening")
+        asyncio.create_task(asyncio.to_thread(self._play_system_sound, "auto_unmute"))
+
+    def _write_wav_chunk(self, chunk_bytes: bytes) -> str:
+        """Writes raw int16 PCM (matching SEND_SAMPLE_RATE/CHANNELS, same
+        format voice/stt.py's record_audio produces) to a temp WAV file so
+        the existing transcribe() can be reused as-is."""
+        temp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        with wave.open(temp_path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SEND_SAMPLE_RATE)
+            wf.writeframes(chunk_bytes)
+        return temp_path
 
     def _build_config(self):
         kwargs = dict(
@@ -870,6 +888,51 @@ class VisionLive:
             print(f"[vision_live] Mic unavailable: {e}")
             return False
 
+    async def _auto_mute_idle_watcher(self):
+        """Persistent background task (like _proactive_monitor_loop) --
+        naturally no-ops while dormant/manually-muted/already-auto-muted/
+        VISION-speaking via the guard below, so it doesn't need to be torn
+        down and recreated on every reconnect the way the per-connection
+        audio tasks do."""
+        while True:
+            await asyncio.sleep(1)
+            if (
+                self._active
+                and not self._muted
+                and not self._muted_auto
+                and not self._is_speaking
+                and (time.time() - self._last_active_time > AUTO_MUTE_IDLE_SECONDS)
+            ):
+                self._engage_auto_mute()
+
+    async def _auto_mute_wake_word_watcher(self):
+        """While auto-muted, periodically transcribes whatever's been
+        buffered locally (see the callback in _listen_audio_awake) and
+        checks for the wake phrase, exactly like the dormant wake-word loop
+        but operating on audio from the already-open awake-session stream
+        instead of a separate recording."""
+        while True:
+            await asyncio.sleep(WAKE_CHUNK_DURATION)
+
+            if not self._muted_auto:
+                self._auto_mute_audio_buffer.clear()
+                continue
+
+            chunk = bytes(self._auto_mute_audio_buffer)
+            self._auto_mute_audio_buffer.clear()
+            if not chunk:
+                continue
+
+            try:
+                audio_path = await asyncio.to_thread(self._write_wav_chunk, chunk)
+                text = await asyncio.to_thread(transcribe, audio_path)
+            except Exception as e:
+                print(f"[vision_live] Auto-mute wake-word check failed: {e}")
+                continue
+
+            if text and WAKE_PHRASE in text.lower():
+                self._disengage_auto_mute()
+
     async def _proactive_monitor_loop(self):
         while True:
             await asyncio.sleep(PROACTIVE_CHECK_INTERVAL)
@@ -953,6 +1016,15 @@ class VisionLive:
 
         def callback(indata, frames, time_info, status):
             if self._muted:
+                # Manual mute takes full precedence: no forwarding, and no
+                # local wake-word scanning either -- manual mute only lifts
+                # on an explicit "unmute", never automatically.
+                return
+
+            if self._muted_auto:
+                # Not forwarding to Gemini, but still buffer locally so the
+                # wake-word watcher can notice the wake phrase and resume.
+                self._auto_mute_audio_buffer.extend(indata.tobytes())
                 return
 
             # Headphones: always send audio, letting Gemini's native VAD
@@ -1157,6 +1229,8 @@ class VisionLive:
         self._shutdown_event = asyncio.Event()
         self._active = True
         self._last_active_time = time.time()
+        self._muted_auto = False
+        self._auto_mute_audio_buffer.clear()
         greeted = False
 
         while True:
@@ -1274,6 +1348,8 @@ class VisionLive:
     async def run(self):
         asyncio.create_task(self._proactive_monitor_loop())
         asyncio.create_task(slack_control.run_slack_listener(self._on_relevant_slack_event))
+        asyncio.create_task(self._auto_mute_idle_watcher())
+        asyncio.create_task(self._auto_mute_wake_word_watcher())
 
         while True:
             try:

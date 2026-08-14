@@ -18,6 +18,7 @@ from system_control import code_exec
 from system_control import computer_control
 from system_control import spotify_control
 from system_control import slack_control
+from system_control import media_control
 
 CONFIRMATION_TTL_SECONDS = 120
 
@@ -49,6 +50,10 @@ ACTION_REGISTRY = {
     "resume_spotify": {"function": spotify_control.resume_spotify, "requires_confirmation": False},
     "next_spotify_track": {"function": spotify_control.next_spotify_track, "requires_confirmation": False},
     "send_slack_message": {"function": slack_control.send_slack_message, "requires_confirmation": True},
+    "slack_catch_me_up": {"function": slack_control.slack_catch_me_up, "requires_confirmation": False},
+    "toggle_media_playback": {"function": media_control.toggle_media_playback, "requires_confirmation": False},
+    "next_media_track": {"function": media_control.next_media_track, "requires_confirmation": False},
+    "previous_media_track": {"function": media_control.previous_media_track, "requires_confirmation": False},
 }
 
 
