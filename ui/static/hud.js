@@ -49,9 +49,9 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 })();
 
 // ── Proportions ───────────────────────────────────────────────────────────
-const HEAD_W = 0.88;
-const HEAD_H = 1.04;
-const HEAD_D = 0.95;
+const HEAD_W = 0.84;
+const HEAD_H = 1.12;
+const HEAD_D = 0.82;
 
 // Feature heights sit low on the sphere on purpose: with the eyes any higher
 // the cranium dominates and the whole head reads as an egg.
@@ -88,35 +88,33 @@ function shapeHead(p) {
   p.y *= HEAD_H;
   p.z *= HEAD_D;
 
-  // Jaw taper — narrows toward the chin without coming to a point.
+  // Jaw taper — sharp, angular taper to a defined chin.
   const below = Math.max(0, -uy);
-  const taper = 1 - 0.36 * Math.pow(below, 1.45);
+  const taper = 1 - 0.48 * Math.pow(below, 1.80);
   p.x *= taper;
-  p.z *= taper * (1 - 0.10 * Math.pow(below, 2.4));
+  p.z *= taper * (1 - 0.15 * Math.pow(below, 2.0));
 
   const frontness = Math.max(0, uz);
 
-  // Flatten the face plate so it reads as panels rather than a ball.
-  p.z -= frontness * 0.130 * (1 - uy * uy);
+  // Flatten the face plate aggressively — machined slab appearance.
+  p.z -= frontness * 0.185 * (1 - uy * uy);
 
-  // Brow ridge above the eye line. These uy values track the painted feature
-  // heights — move a seam in the texture and its ridge has to follow.
-  p.z += Math.exp(-Math.pow((uy - 0.18) / 0.10, 2)) * frontness * 0.045;
+  // Brow ridge — very sharp and defined.
+  p.z += Math.exp(-Math.pow((uy - 0.18) / 0.085, 2)) * frontness * 0.065;
 
-  // Chin projection.
-  p.z += Math.exp(-Math.pow((uy + 0.73) / 0.20, 2)) * frontness * 0.070;
+  // Chin projection — very prominent and sharp.
+  p.z += Math.exp(-Math.pow((uy + 0.75) / 0.15, 2)) * frontness * 0.125;
 
-  // Cheekbones — kept shallow; any stronger and they catch the fill light as
-  // two pale blotches that read as blusher.
+  // Cheekbones — kept shallow.
   const cheek =
-    Math.exp(-Math.pow((uy + 0.28) / 0.18, 2)) *
-    Math.exp(-Math.pow((Math.abs(ux) - 0.62) / 0.30, 2)) *
+    Math.exp(-Math.pow((uy + 0.30) / 0.16, 2)) *
+    Math.exp(-Math.pow((Math.abs(ux) - 0.64) / 0.28, 2)) *
     frontness;
-  p.x += Math.sign(ux) * cheek * 0.022;
+  p.x += Math.sign(ux) * cheek * 0.018;
 
-  // Flatten the crown so the skull doesn't dome up into an egg.
-  const crown = Math.max(0, uy - 0.45) / 0.55;
-  p.y -= crown * crown * 0.275;
+  // Fuller cranium — less flattening on top.
+  const crown = Math.max(0, uy - 0.60) / 0.40;
+  p.y -= crown * crown * 0.120;
 
   // Occiput — a little extension at the back.
   p.z -= Math.max(0, -uz) * 0.05 * (1 - uy * uy);
@@ -246,8 +244,9 @@ function makePlatingMaps() {
 
   // Nose bridge — fine seam detail, no nostril flare. Deliberately faint; at
   // full seam weight the centreline reads as a scar down the face.
-  seam([[FACE_U, 0.485], [FACE_U, 0.650]], { width: 0.55, ao: 5 });
-  seamPair([[FACE_U + 0.004, 0.641], [FACE_U + 0.024, 0.653]], { width: 0.55, ao: 4 });
+  // Nose seam — more defined.
+  seam([[FACE_U, 0.485], [FACE_U, 0.650]], { width: 0.70, ao: 6 });
+  seamPair([[FACE_U + 0.004, 0.641], [FACE_U + 0.025, 0.653]], { width: 0.60, ao: 5 });
 
   // Cheek panels.
   // Kept out at the edge of the face plate — drawn closer in they read as
@@ -281,9 +280,9 @@ function makePlatingMaps() {
 
     // The dark almond itself, in all three maps.
     for (const t of [
-      { ctx: alb, fill: '#0d0f15' },
-      { ctx: bmp, fill: '#787878' },
-      { ctx: rgh, fill: '#8a8a8a' },   // matte: kills the cavity hotspot
+      { ctx: alb, fill: '#050708' },
+      { ctx: bmp, fill: '#6a6a6a' },
+      { ctx: rgh, fill: '#9c9c9c' },   // slightly less matte
     ]) {
       t.ctx.fillStyle = t.fill;
       t.ctx.beginPath();
