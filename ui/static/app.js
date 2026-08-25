@@ -40,7 +40,7 @@ function closeVisualPanel() {
 
 function setStatus(state) {
   statusText.textContent = state;
-  if (window.setOrbState) window.setOrbState(state);
+  if (window.setHudState) window.setHudState(state);
 }
 
 function showResponse(text) {

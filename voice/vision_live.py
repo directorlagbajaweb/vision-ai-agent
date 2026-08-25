@@ -621,21 +621,46 @@ class VisionLive:
             wf.writeframes(chunk_bytes)
         return temp_path
 
-    def _build_config(self):
+    def _build_config(self, headphones_mode: bool):
+        # There is no real acoustic echo cancellation anywhere in this
+        # pipeline -- the only existing mechanism (see _listen_audio_awake)
+        # is gating the mic while self._is_speaking is True on speaker mode,
+        # which only accounts for VISION'S OWN generated speech. It does
+        # nothing about a separate app (Spotify, a browser, etc.) playing
+        # through the same speakers -- that audio is picked up by the mic
+        # and sent to Gemini like any other input, and Gemini's server-side
+        # VAD has no way to know it isn't the user talking. HIGH/HIGH
+        # sensitivity (tuned for snappy reaction) makes this worse: it
+        # triggers on quieter/more ambiguous audio, including music/singing.
+        # The SDK only exposes a binary HIGH/LOW choice here, no separate
+        # music-vs-speech classifier or continuous confidence threshold.
+        # Real proper AEC would mean replacing sounddevice/PortAudio's mic
+        # capture with AVAudioEngine's voice-processing input node (Apple's
+        # AUVoiceProcessingIO, which cancels against whatever the system is
+        # currently outputting, not just this app's own audio) -- a real,
+        # meaningfully larger change not made here.
+        # As a real, available mitigation: headphone audio physically can't
+        # leak into the mic, so keep the snappy HIGH/HIGH sensitivity there;
+        # on speakers, where leakage is real, use LOW/LOW so ambient/media
+        # audio needs a much clearer, unambiguous speech signal to register
+        # as speech at all -- which also directly raises the bar for a
+        # false barge-in/interruption, since the same sensitivity setting
+        # governs both turn-start and mid-response interruption detection.
+        sensitivity = (
+            (types.StartSensitivity.START_SENSITIVITY_HIGH, types.EndSensitivity.END_SENSITIVITY_HIGH)
+            if headphones_mode
+            else (types.StartSensitivity.START_SENSITIVITY_LOW, types.EndSensitivity.END_SENSITIVITY_LOW)
+        )
         kwargs = dict(
             response_modalities=["AUDIO"],
             system_instruction=types.Content(parts=[types.Part(text=SYSTEM_PROMPT)]),
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
             input_audio_transcription={},
             output_audio_transcription={},
-            # Tuned for a snappier feel: react to speech starting/stopping
-            # faster than the SDK defaults, while keeping enough padding/
-            # silence margin to avoid clipping the first phoneme or cutting
-            # someone off on a mid-sentence breath.
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    start_of_speech_sensitivity=sensitivity[0],
+                    end_of_speech_sensitivity=sensitivity[1],
                     prefix_padding_ms=100,
                     silence_duration_ms=500,
                 ),
@@ -1236,10 +1261,9 @@ class VisionLive:
         while True:
             try:
                 client = genai.Client(api_key=config.GEMINI_API_KEY)
-                live_config = self._build_config()
-
                 self._headphones_mode = is_headphones_active()
                 print(f"[vision_live] Output device check — headphones mode: {self._headphones_mode}")
+                live_config = self._build_config(self._headphones_mode)
                 print("[vision_live] Connecting to Gemini Live...")
 
                 async with client.aio.live.connect(model=LIVE_MODEL, config=live_config) as session:
