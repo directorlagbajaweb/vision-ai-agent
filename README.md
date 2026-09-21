@@ -1,6 +1,6 @@
 # VISION
 
-A voice-first personal AI assistant for macOS — talk to it naturally, and it can control your Mac, browse and interact with real apps and websites, search the web, run code, and remember what you've told it, all while showing a live glowing orb that reacts to what it's doing.
+A voice-first personal AI assistant for macOS — talk to it naturally, and it can control your Mac, browse and interact with real apps and websites, search the web, run code, and remember what you've told it, all while showing a live transcript and an audio visualizer that reacts to what it's doing.
 
 Built on Gemini Live for native, low-latency voice-to-voice conversation (not a cascaded transcribe → text-model → text-to-speech pipeline).
 
@@ -14,7 +14,7 @@ Built on Gemini Live for native, low-latency voice-to-voice conversation (not a 
 - **File access** — read/list/search files, sandboxed to your home directory
 - **Screen & camera awareness** — VISION can watch your screen or camera and describe what it sees
 - **Memory** — durable facts, semantic search over past conversations, recent context in every turn
-- **Visual HUD** — a Three.js particle orb that visibly shifts (idle / listening / processing / speaking) plus panels for code, search results, and live webpage previews
+- **Visual HUD** — a LiveKit-style agent window: a state pill (idle / listening / thinking / speaking / muted), an audio-reactive bar visualizer driven by real mic and output levels, a streaming transcript of both sides, and inline cards for code, search results and execution output, plus a full-window overlay for rendered webpages
 - **Acoustic cues** — short synthesized tones (thinking / success / error / waiting) that cover the gap while VISION is working
 - **Confirmation gating** — risky actions (closing an app, running a Shortcut, executing code, starting a GUI-automation task) require a one-time confirmation token before they run
 
@@ -89,7 +89,7 @@ memory/
   semantic.py               Chroma-based semantic search over past conversations
 
 ui/
-  static/                  The HUD: orb.js (Three.js particle orb), app.js, index.html
+  static/                  The HUD: index.html, style.css, app.js (visualizer + transcript)
   ui.py                    Alternate pywebview entry point (bridges to brain/, unused by main.py)
 ```
 

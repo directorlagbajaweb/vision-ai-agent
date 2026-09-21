@@ -15,7 +15,10 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 import config
 
-_client = chromadb.PersistentClient(path=str(config.BASE_DIR / "memory" / "chroma_store"))
+# DATA_DIR, not BASE_DIR: inside a py2app bundle the project directory is
+# read-only Resources, so the vector store lives with the rest of the
+# writable data (see config._data_dir).
+_client = chromadb.PersistentClient(path=str(config.DATA_DIR / "memory" / "chroma_store"))
 _collection = _client.get_or_create_collection(name="conversation_memory")
 
 print("[semantic] Loading local embedding model (first run may take a moment)...")

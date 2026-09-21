@@ -6,9 +6,26 @@ reflects idle/listening/speaking/muted state in real time.
 """
 
 import asyncio
-from pathlib import Path
+import os
+import sys
+
+# py2app's ssl recipe unconditionally points SSL_CERT_FILE/SSL_CERT_DIR at
+# Contents/Resources/openssl.ca — a directory it only creates if the building
+# interpreter has an on-disk CA bundle. The python.org framework builds report
+# cafile=None (they rely on certifi), so the path never exists and the first
+# TLS call dies with FileNotFoundError before the window even opens. Point both
+# at the certifi bundle shipped in DATA_FILES instead. This has to run before
+# anything constructs an SSLContext, so it stays above the other imports.
+if getattr(sys, "frozen", False):
+    _ca = os.path.join(os.environ.get("RESOURCEPATH", ""), "certs", "cacert.pem")
+    if os.path.exists(_ca):
+        os.environ["SSL_CERT_FILE"] = _ca
+        os.environ["SSL_CERT_DIR"] = os.path.dirname(_ca)
+        os.environ["REQUESTS_CA_BUNDLE"] = _ca
 
 import webview
+
+import config
 from voice.vision_live import VisionLive
 from memory.db import init_db
 
@@ -33,7 +50,9 @@ def start_voice_backend(window, api):
 
 
 def main():
-    html_path = Path(__file__).parent / "ui" / "static" / "index.html"
+    # Resolved from the bundle/source location, never the working directory —
+    # a double-clicked .app starts in "/".
+    html_path = config.resource_path("ui", "static", "index.html")
     api = VisionAPI()
 
     window = webview.create_window(
@@ -41,8 +60,9 @@ def main():
         str(html_path),
         js_api=api,
         width=900,
-        height=700,
-        background_color="#050810",
+        height=740,
+        min_size=(420, 520),
+        background_color="#09090b",
         easy_drag=True,
     )
 

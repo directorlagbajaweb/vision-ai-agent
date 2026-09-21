@@ -5,16 +5,65 @@ Loads API keys from .env and defines model routing, paths, and app settings.
 """
 
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load variables from .env into the environment
-load_dotenv()
-
 # ── Paths ─────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-MEMORY_DB_PATH = BASE_DIR / "memory" / "vision.db"
-LOG_FILE_PATH = BASE_DIR / "logs" / "vision.log"
+
+
+def _resource_dir() -> Path:
+    """Where VISION's bundled files (.env, ui/static) actually live.
+
+    py2app sets sys.frozen and puts everything from DATA_FILES in
+    Contents/Resources (symlinks back to this source tree in an alias build).
+    Running from source, that's just the project directory. Either way this is
+    resolved from the executable/module location, never from the working
+    directory the app was launched with — a double-clicked .app starts in /.
+    """
+    if getattr(sys, "frozen", False):
+        resources = Path(sys.executable).resolve().parent.parent / "Resources"
+        if resources.is_dir():
+            return resources
+    return BASE_DIR
+
+
+RESOURCE_DIR = _resource_dir()
+
+
+def resource_path(*parts) -> Path:
+    """A bundled file, falling back to the source tree if it isn't bundled."""
+    bundled = RESOURCE_DIR.joinpath(*parts)
+    return bundled if bundled.exists() else BASE_DIR.joinpath(*parts)
+
+
+# Load variables from .env into the environment. Explicit path: load_dotenv()
+# with no argument walks up from the working directory, which finds nothing
+# when launched as an .app.
+ENV_PATH = resource_path(".env")
+load_dotenv(ENV_PATH if ENV_PATH.exists() else None)
+
+
+def _data_dir() -> Path:
+    """Where VISION writes: the conversation DB and logs.
+
+    Running from source, that stays in the project. Inside a py2app bundle it
+    has to move out — Contents/Resources is the wrong place to write to (it is
+    read-only once the .app is signed or relocated), so use the standard
+    per-user location instead.
+    """
+    if getattr(sys, "frozen", False):
+        data = Path.home() / "Library" / "Application Support" / "VISION"
+        (data / "memory").mkdir(parents=True, exist_ok=True)
+        (data / "logs").mkdir(parents=True, exist_ok=True)
+        return data
+    return BASE_DIR
+
+
+DATA_DIR = _data_dir()
+MEMORY_DB_PATH = DATA_DIR / "memory" / "vision.db"
+LOG_FILE_PATH = DATA_DIR / "logs" / "vision.log"
 
 # ── API Keys (loaded from .env) ──────────────────────
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")

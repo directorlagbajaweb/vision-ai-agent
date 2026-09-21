@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import sounddevice as sd
 import mss
 import cv2
@@ -441,6 +442,40 @@ TOOL_DECLARATIONS = [
 ]
 
 
+def _log(msg: str):
+    """Timestamped, line-flushed log. Used for everything that decides whether
+    VISION can hear you — mute transitions and wake-word attempts — so that a
+    "it stopped responding" report can be read straight off the terminal."""
+    print(f"[{time.strftime('%H:%M:%S')}.{int(time.time() % 1 * 1000):03d}] [vision_live] {msg}", flush=True)
+
+
+def _wav_level(path: str) -> float:
+    """Peak-ish level of a recorded chunk, so the log can tell 'nobody spoke'
+    apart from 'the mic handed us digital silence'."""
+    try:
+        with wave.open(path, "rb") as wf:
+            return _rms_level(wf.readframes(wf.getnframes()))
+    except Exception:
+        return -1.0
+
+
+def _rms_level(samples) -> float:
+    """Perceptual 0..1 level for a chunk of int16 PCM, for the HUD's audio
+    visualizer. Cheap enough to run inside the realtime audio callback."""
+    try:
+        arr = (np.frombuffer(samples, dtype=np.int16)
+               if isinstance(samples, (bytes, bytearray, memoryview))
+               else np.asarray(samples))
+        if arr.size == 0:
+            return 0.0
+        rms = float(np.sqrt(np.mean(np.square(arr.astype(np.float32)))))
+        # int16 full scale is 32768; the sqrt curve lifts ordinary speech
+        # into a range the bars can actually show instead of a flat nub.
+        return min(1.0, (rms / 32768.0) ** 0.5 * 1.6)
+    except Exception:
+        return 0.0
+
+
 def is_headphones_active() -> bool:
     """Checks the current default audio OUTPUT device name for headphone-like keywords."""
     try:
@@ -486,6 +521,24 @@ class VisionLive:
         self._proactive_message = None
         self._notified_events = set()
         self._headphones_mode = False
+        self._mic_level = 0.0
+        self._agent_level = 0.0
+        self._last_capture_at = 0.0     # last time the mic callback actually fired
+        self._capture_stall_logged = False
+        self._wake_attempts = 0
+        self._silent_chunks = 0
+
+    def _hearing_state(self) -> str:
+        """One-line answer to 'could VISION have heard me just now?'"""
+        idle_age = (time.time() - self._last_active_time) if self._last_active_time else None
+        capture_age = (time.time() - self._last_capture_at) if self._last_capture_at else None
+        return (
+            f"active={self._active} muted={self._muted} auto_muted={self._muted_auto} "
+            f"speaking={self._is_speaking} "
+            f"idle_age={'n/a' if idle_age is None else f'{idle_age:.1f}s'} "
+            f"last_capture={'never' if capture_age is None else f'{capture_age:.1f}s ago'} "
+            f"wake_buffer={len(self._auto_mute_audio_buffer)}B"
+        )
 
     def _set_ui_status(self, status: str):
         if self.ui_window:
@@ -494,11 +547,38 @@ class VisionLive:
             except Exception:
                 pass
 
-    def _set_ui_response(self, text: str):
-        if self.ui_window:
-            safe = text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+    def _set_ui_transcript(self, role: str, text: str, final: bool = False):
+        """Streams a turn into the HUD transcript. Called repeatedly with the
+        growing partial while someone is still talking, then once more with
+        final=True to close the bubble off."""
+        if self.ui_window and text:
             try:
-                self.ui_window.evaluate_js(f"window.updateResponse && window.updateResponse('{safe}')")
+                self.ui_window.evaluate_js(
+                    f"window.updateTranscript && window.updateTranscript("
+                    f"{json.dumps(role)}, {json.dumps(text)}, {'true' if final else 'false'})"
+                )
+            except Exception:
+                pass
+
+    def _set_ui_levels(self, user_level: float, agent_level: float):
+        """Both audio levels in a single evaluate_js — this runs ~15x/sec, so
+        it stays one round-trip per frame."""
+        if self.ui_window:
+            try:
+                self.ui_window.evaluate_js(
+                    f"window.setAudioLevel && (window.setAudioLevel('user', {user_level:.3f}),"
+                    f" window.setAudioLevel('agent', {agent_level:.3f}))"
+                )
+            except Exception:
+                pass
+
+    def _set_ui_tool(self, name: str, active: bool):
+        if self.ui_window:
+            try:
+                self.ui_window.evaluate_js(
+                    f"window.setToolActivity && window.setToolActivity("
+                    f"{json.dumps(name)}, {'true' if active else 'false'})"
+                )
             except Exception:
                 pass
 
@@ -576,7 +656,7 @@ class VisionLive:
             self._auto_mute_audio_buffer.clear()
         else:
             self._last_active_time = time.time()
-        print(f"[vision_live] Mute set to: {muted}")
+        _log(f"MANUAL {'MUTE' if muted else 'UNMUTE'} (HUD button) — {self._hearing_state()}")
         state = "muted" if muted else ("listening" if self._active else "idle")
         self._set_ui_status(state)
 
@@ -598,14 +678,15 @@ class VisionLive:
 
     def _engage_auto_mute(self):
         self._muted_auto = True
-        print(f"[vision_live] Auto-muted after {AUTO_MUTE_IDLE_SECONDS}s of inactivity (connection stays open).")
+        _log(f"AUTO-MUTE ENGAGED after {AUTO_MUTE_IDLE_SECONDS}s idle (connection stays open). "
+             f"Only the local wake-word check can lift this — {self._hearing_state()}")
         self._set_ui_status("muted")
         asyncio.create_task(asyncio.to_thread(self._play_system_sound, "auto_mute"))
 
     def _disengage_auto_mute(self):
         self._muted_auto = False
         self._last_active_time = time.time()
-        print("[vision_live] Wake phrase heard while auto-muted -- resuming.")
+        _log(f"AUTO-MUTE LIFTED — wake phrase heard while auto-muted. {self._hearing_state()}")
         self._set_ui_status("listening")
         asyncio.create_task(asyncio.to_thread(self._play_system_sound, "auto_unmute"))
 
@@ -921,6 +1002,21 @@ class VisionLive:
         audio tasks do."""
         while True:
             await asyncio.sleep(1)
+
+            # A live session whose mic callback has gone quiet is the one
+            # condition that both triggers auto-mute AND starves the
+            # wake-word check that is supposed to undo it.
+            if self._active and not self._muted and self._last_capture_at:
+                capture_age = time.time() - self._last_capture_at
+                if capture_age > 5 and not self._capture_stall_logged:
+                    self._capture_stall_logged = True
+                    _log(f"WARNING: no mic callback for {capture_age:.1f}s — the capture stream "
+                         f"looks stalled; VISION cannot hear anything in this state. "
+                         f"{self._hearing_state()}")
+                elif capture_age <= 5 and self._capture_stall_logged:
+                    self._capture_stall_logged = False
+                    _log(f"mic callback resumed after a stall. {self._hearing_state()}")
+
             if (
                 self._active
                 and not self._muted
@@ -946,16 +1042,23 @@ class VisionLive:
             chunk = bytes(self._auto_mute_audio_buffer)
             self._auto_mute_audio_buffer.clear()
             if not chunk:
+                _log(f"wake-check (auto-muted): NO AUDIO BUFFERED in the last "
+                     f"{WAKE_CHUNK_DURATION}s — nothing is reaching the wake-word check, so "
+                     f"saying '{config.WAKE_WORD}' cannot lift auto-mute. {self._hearing_state()}")
                 continue
 
             try:
                 audio_path = await asyncio.to_thread(self._write_wav_chunk, chunk)
+                level = await asyncio.to_thread(_wav_level, audio_path)
                 text = await asyncio.to_thread(transcribe, audio_path)
             except Exception as e:
-                print(f"[vision_live] Auto-mute wake-word check failed: {e}")
+                _log(f"wake-check (auto-muted) FAILED: {e!r} — {self._hearing_state()}")
                 continue
 
-            if text and WAKE_PHRASE in text.lower():
+            hit = bool(text and WAKE_PHRASE in text.lower())
+            _log(f"wake-check (auto-muted): {len(chunk)/2/SEND_SAMPLE_RATE:.1f}s buffered, "
+                 f"level={level:.3f}, heard={text!r} -> {'WAKE' if hit else 'no match'}")
+            if hit:
                 self._disengage_auto_mute()
 
     async def _proactive_monitor_loop(self):
@@ -987,35 +1090,71 @@ class VisionLive:
                 break
 
     async def _wait_for_wake_phrase(self):
-        print(f"[vision_live] Dormant. Say '{config.WAKE_WORD}' to activate...")
+        _log(f"DORMANT — say '{config.WAKE_WORD}' to activate. {self._hearing_state()}")
         self._set_ui_status("muted" if self._muted else "idle")
 
         await asyncio.sleep(0.5)
 
+        last_chunk_end = 0.0
+        muted_notice = [False]
+
         async def listen_loop():
+            nonlocal last_chunk_end
             while True:
                 if self._muted:
+                    # Manually muted while dormant: nothing is being recorded at
+                    # all, so the wake word cannot work until it is unmuted.
+                    if not muted_notice[0]:
+                        muted_notice[0] = True
+                        _log(f"dormant but MANUALLY MUTED — wake word is disabled until you "
+                             f"unmute in the HUD. {self._hearing_state()}")
                     self._set_ui_status("muted")
                     await asyncio.sleep(0.5)
                     continue
+                if muted_notice[0]:
+                    muted_notice[0] = False
+                    _log(f"unmuted — wake-word listening resumes. {self._hearing_state()}")
 
                 if not await self._check_mic_available():
+                    _log(f"wake-check #{self._wake_attempts + 1} SKIPPED: mic unavailable, "
+                         f"retrying in 3s (deaf until then). {self._hearing_state()}")
                     self._set_ui_status("mic_unavailable")
                     await asyncio.sleep(3)
                     continue
                 try:
+                    self._wake_attempts += 1
+                    gap = (time.time() - last_chunk_end) if last_chunk_end else 0.0
+                    started = time.time()
                     audio_path = await asyncio.to_thread(record_audio, WAKE_CHUNK_DURATION)
+                    last_chunk_end = time.time()
+                    level = await asyncio.to_thread(_wav_level, audio_path)
                     text = await asyncio.to_thread(transcribe, audio_path)
                 except Exception as e:
-                    print(f"[vision_live] Mic error while dormant: {e}")
+                    _log(f"wake-check #{self._wake_attempts} FAILED: {e!r} — "
+                         f"retrying in 1s. {self._hearing_state()}")
                     self._set_ui_status("mic_unavailable")
                     await asyncio.sleep(1)
                     continue
 
-                print(f"[vision_live] Heard: '{text}'")
+                hit = bool(text and WAKE_PHRASE in text.lower())
 
-                if text and WAKE_PHRASE in text.lower():
-                    print(f"[vision_live] Wake phrase heard in: '{text}' — waking up.")
+                # Digital silence is not the same as a quiet room: a device that
+                # has gone away often keeps handing back zeroes forever.
+                if 0 <= level < 0.002:
+                    self._silent_chunks += 1
+                    if self._silent_chunks in (3, 10) or self._silent_chunks % 25 == 0:
+                        _log(f"WARNING: {self._silent_chunks} consecutive near-silent chunks "
+                             f"(level={level:.4f}) — the mic may be handing back digital silence. "
+                             f"{self._hearing_state()}")
+                else:
+                    self._silent_chunks = 0
+
+                _log(f"wake-check #{self._wake_attempts}: mic closed {gap*1000:.0f}ms before this "
+                     f"chunk, captured {time.time()-started:.1f}s, level={level:.3f}, "
+                     f"heard={text!r} -> {'WAKE' if hit else 'no match'}")
+
+                if hit:
+                    _log(f"WAKE PHRASE accepted — starting session. {self._hearing_state()}")
                     return "wake_phrase"
 
         listen_task = asyncio.create_task(listen_loop())
@@ -1027,6 +1166,15 @@ class VisionLive:
 
         for t in pending:
             t.cancel()
+
+        if listen_task in done and not listen_task.cancelled():
+            exc = listen_task.exception()
+            if exc is not None:
+                # Without this the crash is invisible: the function falls
+                # through and reports a wake phrase nobody said.
+                _log(f"CRITICAL: the dormant wake-word listener crashed with {exc!r}. "
+                     f"VISION was not listening. {self._hearing_state()}")
+                traceback.print_exception(type(exc), exc, exc.__traceback__)
 
         if proactive_task in done:
             self._proactive_trigger.clear()
@@ -1040,6 +1188,11 @@ class VisionLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            # Just store the level — evaluate_js must never be called from
+            # the realtime audio thread. _ui_level_pump forwards it.
+            self._mic_level = 0.0 if self._muted else _rms_level(indata)
+            self._last_capture_at = time.time()
+
             if self._muted:
                 # Manual mute takes full precedence: no forwarding, and no
                 # local wake-word scanning either -- manual mute only lifts
@@ -1106,6 +1259,7 @@ class VisionLive:
             partial = " ".join(out_buf).strip()
             out_buf.clear()
             if partial:
+                self._set_ui_transcript("agent", partial, final=True)
                 print(f"VISION (interrupted): {partial}")
                 save_message("assistant", f"[Interrupted by user] {partial}")
 
@@ -1195,6 +1349,7 @@ class VisionLive:
 
                     if sc.input_transcription and sc.input_transcription.text:
                         in_buf.append(sc.input_transcription.text.strip())
+                        self._set_ui_transcript("user", " ".join(in_buf).strip())
                         self._last_input_chunk_at = time.time()
                         asyncio.create_task(self._maybe_signal_processing(self._last_input_chunk_at))
 
@@ -1204,6 +1359,7 @@ class VisionLive:
                         self._is_speaking = True
                         self._speaking_generation += 1
                         out_buf.append(sc.output_transcription.text.strip())
+                        self._set_ui_transcript("agent", " ".join(out_buf).strip())
 
                     if sc.turn_complete:
                         asyncio.create_task(self._finish_speaking(self._speaking_generation))
@@ -1212,6 +1368,7 @@ class VisionLive:
                         full_out = " ".join(out_buf).strip()
 
                         if full_in:
+                            self._set_ui_transcript("user", full_in, final=True)
                             print(f"You: {full_in}")
                             save_message("user", full_in)
                             semantic_add("user", full_in)
@@ -1219,14 +1376,20 @@ class VisionLive:
                             print(f"VISION: {full_out}")
                             save_message("assistant", full_out)
                             semantic_add("assistant", full_out)
-                            self._set_ui_response(full_out)
+                            self._set_ui_transcript("agent", full_out, final=True)
 
                         in_buf, out_buf = [], []
 
                 if response.tool_call:
                     self._tool_call_in_progress = True
                     try:
-                        fn_responses = [await self._execute_tool(fc) for fc in response.tool_call.function_calls]
+                        fn_responses = []
+                        for fc in response.tool_call.function_calls:
+                            self._set_ui_tool(fc.name, True)
+                            try:
+                                fn_responses.append(await self._execute_tool(fc))
+                            finally:
+                                self._set_ui_tool(fc.name, False)
                     finally:
                         self._tool_call_in_progress = False
                     async with self._session_send_lock:
@@ -1240,10 +1403,30 @@ class VisionLive:
         try:
             while True:
                 chunk = await self.audio_in_queue.get()
+                self._agent_level = _rms_level(chunk)
                 await asyncio.to_thread(stream.write, chunk)
         finally:
             stream.stop()
             stream.close()
+
+    async def _ui_level_pump(self):
+        """Forwards mic/output audio levels to the HUD visualizer at ~15fps.
+        Levels decay between pushes so the bars fall back to rest on their own
+        once a stream stops producing chunks, and silence isn't re-sent."""
+        was_quiet = False
+        while True:
+            await asyncio.sleep(1 / 15)
+            if not self.ui_window:
+                return
+
+            user, agent = self._mic_level, self._agent_level
+            quiet = user < 0.005 and agent < 0.005
+            if not (quiet and was_quiet):
+                await asyncio.to_thread(self._set_ui_levels, user, agent)
+            was_quiet = quiet
+
+            self._mic_level *= 0.5
+            self._agent_level *= 0.5
 
     async def _run_session(self, proactive_message: str = None):
         """Stays active for as long as the process is online. A crash or
@@ -1322,6 +1505,7 @@ class VisionLive:
                         asyncio.create_task(self._receive_audio()),
                         asyncio.create_task(self._play_audio()),
                         asyncio.create_task(self._live_notification_watcher()),
+                        asyncio.create_task(self._ui_level_pump()),
                     ]
                     shutdown_task = asyncio.create_task(self._shutdown_event.wait())
 

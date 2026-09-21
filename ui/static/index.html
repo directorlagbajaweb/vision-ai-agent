@@ -2,72 +2,76 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>VISION</title>
-  <link rel="stylesheet" href="style.css?v=4">
-  <script type="importmap">
-  {
-    "imports": {
-      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-    }
-  }
-  </script>
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
-<body>
+<body data-state="idle">
 
-  <div id="vision-hud">
-    <div class="core-wrapper">
-      <canvas id="hud-canvas"></canvas>
-      <div class="hud-label">
-        <span class="core-text">VISION</span>
-        <span id="status-text" class="status-text">idle</span>
+  <div class="app">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span class="brand-name">VISION</span>
       </div>
-    </div>
-
-    <button id="mute-btn" class="mute-btn" title="Mute VISION">
-      <span id="mute-icon" class="mute-icon">●</span>
-    </button>
-
-    <div id="response-box" class="response-box"></div>
-
-    <div id="code-panel" class="code-panel">
-      <div class="code-panel-header">
-        <span id="code-lang" class="code-lang"></span>
-        <button id="code-copy-btn" class="code-copy-btn">Copy</button>
+      <div class="state-pill" id="state-pill">
+        <span class="state-dot"></span>
+        <span class="state-label" id="state-label">idle</span>
       </div>
-      <pre id="code-content" class="code-content"></pre>
-    </div>
+    </header>
 
-    <div id="search-panel" class="code-panel search-panel">
-      <div class="code-panel-header">
-        <span id="search-query-label" class="code-lang"></span>
+    <section class="stage">
+      <div class="visualizer" id="visualizer" aria-hidden="true"></div>
+      <p class="agent-hint" id="agent-hint">Say &ldquo;Vision&rdquo; to start</p>
+    </section>
+
+    <main class="transcript" id="transcript">
+      <div class="transcript-empty" id="transcript-empty">
+        <p>No conversation yet.</p>
+        <p class="dim">Everything you say and everything VISION does shows up here.</p>
       </div>
-      <div id="search-images" class="search-images"></div>
-      <div id="search-results" class="search-results"></div>
-    </div>
+      <div class="transcript-feed" id="transcript-feed"></div>
+    </main>
 
-    <div id="exec-panel" class="code-panel exec-panel">
-      <div class="code-panel-header">
-        <span class="code-lang">EXECUTION RESULT</span>
+    <footer class="controlbar">
+      <button id="mic-btn" class="mic-btn" type="button" title="Mute VISION" aria-pressed="false">
+        <svg class="icon icon-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="3" width="6" height="11" rx="3"></rect>
+          <path d="M5 11a7 7 0 0 0 14 0"></path>
+          <path d="M12 18v3"></path>
+        </svg>
+        <svg class="icon icon-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M15 9V6a3 3 0 0 0-5.7-1.3"></path>
+          <path d="M9 9v2a3 3 0 0 0 4.6 2.5"></path>
+          <path d="M5 11a7 7 0 0 0 10.9 5.8"></path>
+          <path d="M19 11a6.9 6.9 0 0 1-.7 3"></path>
+          <path d="M12 18v3"></path>
+          <path d="M4 3l16 16"></path>
+        </svg>
+        <span class="mic-label" id="mic-label">Mic on</span>
+        <span class="mic-meter"><span class="mic-meter-fill" id="mic-meter-fill"></span></span>
+      </button>
+
+      <div class="chips">
+        <span class="chip" id="chip-screen"><span class="chip-dot"></span>Screen</span>
+        <span class="chip" id="chip-camera"><span class="chip-dot"></span>Camera</span>
+        <span class="chip chip-tool" id="chip-tool"><span class="chip-spinner"></span><span id="chip-tool-name">tool</span></span>
       </div>
-      <pre id="exec-code" class="code-content exec-code"></pre>
-      <div id="exec-output" class="exec-output"></div>
-    </div>
 
-    <div id="screen-indicator" class="screen-indicator">
-      <span class="screen-dot"></span> WATCHING SCREEN
-    </div>
+      <button id="clear-btn" class="ghost-btn" type="button" title="Clear the transcript view">Clear</button>
+    </footer>
 
-    <div id="camera-indicator" class="screen-indicator camera-indicator">
-      <span class="screen-dot"></span> CAMERA ACTIVE
-    </div>
-
-    <div id="page-render-overlay" class="page-render-overlay">
-      <iframe id="page-render-frame" class="page-render-frame" sandbox="allow-scripts"></iframe>
-    </div>
   </div>
 
-  <script type="module" src="hud.js?v=1"></script>
-  <script src="app.js?v=4"></script>
+  <div class="overlay" id="page-overlay">
+    <div class="overlay-head">
+      <span class="overlay-title">Rendered page</span>
+      <button id="overlay-close" class="ghost-btn" type="button">Close</button>
+    </div>
+    <iframe id="page-frame" class="overlay-frame" sandbox="allow-scripts"></iframe>
+  </div>
+
+  <script src="app.js?v=5"></script>
 </body>
 </html>
