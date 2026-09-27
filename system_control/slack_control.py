@@ -53,18 +53,31 @@ _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 # reach it.
 _event_callback = {"fn": None}
 
+# Slack's SDK applies no deadline to the Socket Mode handshake.
+SOCKET_CONNECT_TIMEOUT = 30
+# Every Web API client gets an explicit read timeout. The SDK default is
+# generous and these calls sit on the path that delivers a DM into a live
+# conversation.
+SLACK_API_TIMEOUT = 20
+
 
 def _get_async_web_client():
     global _async_web_client
     if _async_web_client is None:
-        _async_web_client = AsyncWebClient(token=config.SLACK_USER_TOKEN, ssl=_SSL_CONTEXT)
+        _async_web_client = AsyncWebClient(
+            token=config.SLACK_USER_TOKEN, ssl=_SSL_CONTEXT,
+            timeout=SLACK_API_TIMEOUT,
+        )
     return _async_web_client
 
 
 def _get_sync_web_client():
     global _sync_web_client
     if _sync_web_client is None:
-        _sync_web_client = WebClient(token=config.SLACK_USER_TOKEN, ssl=_SSL_CONTEXT)
+        _sync_web_client = WebClient(
+            token=config.SLACK_USER_TOKEN, ssl=_SSL_CONTEXT,
+            timeout=SLACK_API_TIMEOUT,
+        )
     return _sync_web_client
 
 
@@ -169,7 +182,24 @@ async def run_slack_listener(on_relevant_event):
     client = SocketModeClient(app_token=config.SLACK_APP_TOKEN, web_client=_get_async_web_client())
     client.socket_mode_request_listeners.append(_handle_request)
 
-    await client.connect()
+    # connect() negotiates a WSS URL over HTTP then opens the socket. Neither
+    # step has a timeout of its own, so a stalled connect would leave this
+    # task parked forever with Slack silently non-functional and no error.
+    # Retry rather than give up: this is a lifetime background task.
+    delay = 5
+    while True:
+        try:
+            await asyncio.wait_for(client.connect(), timeout=SOCKET_CONNECT_TIMEOUT)
+            break
+        except asyncio.TimeoutError:
+            print(f"[slack_control] Socket Mode connect timed out after "
+                  f"{SOCKET_CONNECT_TIMEOUT}s -- retrying in {delay}s.")
+        except Exception as e:
+            print(f"[slack_control] Socket Mode connect failed: {e!r} -- "
+                  f"retrying in {delay}s.")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 300)
+
     print("[slack_control] Connected via Socket Mode -- listening for DMs and mentions.")
     await asyncio.Event().wait()
 

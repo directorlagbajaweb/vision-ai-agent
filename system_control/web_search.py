@@ -10,6 +10,8 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import config
 
+SEARCH_TIMEOUT_SECONDS = 20
+
 
 def web_search(query: str, max_results: int = 5) -> dict:
     if not config.TAVILY_API_KEY:
@@ -18,10 +20,13 @@ def web_search(query: str, max_results: int = 5) -> dict:
     try:
         from tavily import TavilyClient
         client = TavilyClient(api_key=config.TAVILY_API_KEY)
+        # Explicit deadline rather than relying on the SDK default, since
+        # this runs on a thread that a voice turn is waiting on.
         response = client.search(
             query=query,
             max_results=max_results,
             include_images=True,
+            timeout=SEARCH_TIMEOUT_SECONDS,
         )
 
         results = [

@@ -14,7 +14,9 @@ import time
 import json
 import wave
 import asyncio
+import queue
 import tempfile
+import threading
 import traceback
 import subprocess
 from pathlib import Path
@@ -30,6 +32,7 @@ from google import genai
 from google.genai import types
 
 import config
+import vision_logging
 from memory.db import init_db, save_message, get_recent_history, save_fact, get_all_facts, delete_fact
 from memory.semantic import add_message as semantic_add, search_relevant as semantic_search
 from system_control import dispatcher
@@ -56,6 +59,20 @@ SHUTDOWN_GRACE_PERIOD = 2.0
 AUTO_MUTE_IDLE_SECONDS = 75
 SCREEN_CAPTURE_INTERVAL = 2.0
 CAMERA_CAPTURE_INTERVAL = 2.0
+
+# Hard ceilings on anything that could otherwise block forever. Every one
+# of these guards a call that has no timeout of its own: an unacknowledged
+# websocket write, a WKWebView that never runs its completion handler, or
+# an audio device that stops draining. Exceeding one is treated as a dead
+# connection -- the task raises, and _run_session reconnects.
+SESSION_SEND_TIMEOUT = 20.0      # a single send_* on the Live websocket
+SESSION_SEND_LOCK_TIMEOUT = 30.0 # waiting for another task's send to finish
+AUDIO_WRITE_TIMEOUT = 10.0       # one blocking write to the output device
+UI_EVAL_TIMEOUT = 5.0            # one evaluate_js round-trip into the HUD
+# Beyond this many queued HUD updates the bridge is presumed wedged and
+# further updates are dropped rather than queued forever. The HUD is a
+# view; losing frames of it must never stall the voice pipeline.
+UI_QUEUE_LIMIT = 200
 
 PROACTIVE_CHECK_INTERVAL = 60
 PROACTIVE_LOOKAHEAD_MINUTES = 10
@@ -527,6 +544,106 @@ class VisionLive:
         self._capture_stall_logged = False
         self._wake_attempts = 0
         self._silent_chunks = 0
+        self._mic_drops = 0
+        # HUD updates run on their own thread, never on the event loop.
+        # pywebview's cocoa evaluate_js does AppHelper.callAfter(...) then
+        # Semaphore.acquire() with NO timeout, so if the WKWebView never
+        # runs its completion handler (web content process wedged or torn
+        # down) the calling thread blocks forever. Calling that from the
+        # event loop -- which is what every _set_ui_* site used to do --
+        # freezes the whole voice pipeline: no audio in, no audio out, and
+        # shutdown_vision can never run.
+        #
+        # Deliberately a plain daemon thread and not a ThreadPoolExecutor:
+        # the executor registers an atexit hook that joins its workers, so
+        # a wedged bridge thread would block interpreter shutdown -- the
+        # "Cmd+Q does nothing, had to force-quit" symptom all over again.
+        # A daemon thread is abandoned at exit instead.
+        self._ui_queue = queue.Queue(maxsize=UI_QUEUE_LIMIT)
+        self._ui_stalled = False
+        self._ui_thread = threading.Thread(
+            target=self._ui_bridge_loop, name="vision-ui-bridge", daemon=True
+        )
+        self._ui_thread.start()
+
+    def _ui_bridge_loop(self):
+        """Drains HUD updates, one at a time, off the event loop."""
+        while True:
+            script = self._ui_queue.get()
+            started = time.monotonic()
+            try:
+                self.ui_window.evaluate_js(script)
+            except Exception as e:
+                print(f"[vision_live] HUD update failed: {e}")
+            elapsed = time.monotonic() - started
+            if elapsed > UI_EVAL_TIMEOUT:
+                _log(f"HUD update took {elapsed:.1f}s (script: {script[:60]!r})")
+
+    def _ui_eval(self, script: str):
+        """Fire-and-forget HUD update. Returns immediately.
+
+        Nothing in the voice pipeline reads a value back from the HUD, so
+        no caller has any reason to wait on the webview. Backlog is
+        bounded: if the bridge thread is wedged inside evaluate_js, updates
+        are dropped and the stall is reported once, rather than queued
+        without limit.
+        """
+        if not self.ui_window:
+            return
+        try:
+            self._ui_queue.put_nowait(script)
+            # Only call it recovered once the backlog has genuinely drained.
+            # A single freed slot means the bridge dequeued one item and is
+            # now wedged on that one instead -- reporting recovery there
+            # would flap a stall line on every update.
+            if self._ui_stalled and self._ui_queue.qsize() <= UI_QUEUE_LIMIT // 4:
+                self._ui_stalled = False
+                _log("HUD bridge recovered.")
+        except queue.Full:
+            if not self._ui_stalled:
+                self._ui_stalled = True
+                _log(f"HUD BRIDGE STALLED — {UI_QUEUE_LIMIT} updates queued and "
+                     f"not draining; dropping further HUD updates. The webview "
+                     f"is not answering evaluate_js.")
+                vision_logging.dump_all_stacks("HUD bridge stalled")
+
+    async def _session_send(self, what: str, coro_factory):
+        """Every write to the Gemini Live websocket goes through here.
+
+        Two unbounded waits used to live on this path and either one could
+        wedge VISION permanently:
+
+          * acquiring _session_send_lock, which is held for the whole
+            duration of another task's send; and
+          * the send itself -- a websocket write on a half-open TCP
+            connection (sleep/wake, Wi-Fi handoff) never returns and never
+            raises, because no FIN or RST is ever received.
+
+        If a send stalls while holding the lock, _send_realtime,
+        _live_notification_watcher and the tool-response path in
+        _receive_audio all block on it forever. No task ever completes, so
+        the asyncio.wait(FIRST_COMPLETED) in _run_session never returns and
+        the reconnect never fires: the app stays running but is completely
+        deaf and mute. Bounding both waits turns that permanent hang into a
+        raised exception, which _run_session already handles by reconnecting.
+        """
+        try:
+            await asyncio.wait_for(
+                self._session_send_lock.acquire(), timeout=SESSION_SEND_LOCK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            _log(f"SESSION SEND LOCK TIMEOUT after {SESSION_SEND_LOCK_TIMEOUT}s "
+                 f"waiting to send {what} — another send is wedged.")
+            vision_logging.dump_all_stacks(f"session send lock timeout ({what})")
+            raise
+        try:
+            await asyncio.wait_for(coro_factory(), timeout=SESSION_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            _log(f"SESSION SEND TIMEOUT after {SESSION_SEND_TIMEOUT}s sending "
+                 f"{what} — treating the Live connection as dead.")
+            raise
+        finally:
+            self._session_send_lock.release()
 
     def _hearing_state(self) -> str:
         """One-line answer to 'could VISION have heard me just now?'"""
@@ -543,7 +660,7 @@ class VisionLive:
     def _set_ui_status(self, status: str):
         if self.ui_window:
             try:
-                self.ui_window.evaluate_js(f"window.updateStatus && window.updateStatus('{status}')")
+                self._ui_eval(f"window.updateStatus && window.updateStatus('{status}')")
             except Exception:
                 pass
 
@@ -553,7 +670,7 @@ class VisionLive:
         final=True to close the bubble off."""
         if self.ui_window and text:
             try:
-                self.ui_window.evaluate_js(
+                self._ui_eval(
                     f"window.updateTranscript && window.updateTranscript("
                     f"{json.dumps(role)}, {json.dumps(text)}, {'true' if final else 'false'})"
                 )
@@ -565,7 +682,7 @@ class VisionLive:
         it stays one round-trip per frame."""
         if self.ui_window:
             try:
-                self.ui_window.evaluate_js(
+                self._ui_eval(
                     f"window.setAudioLevel && (window.setAudioLevel('user', {user_level:.3f}),"
                     f" window.setAudioLevel('agent', {agent_level:.3f}))"
                 )
@@ -575,7 +692,7 @@ class VisionLive:
     def _set_ui_tool(self, name: str, active: bool):
         if self.ui_window:
             try:
-                self.ui_window.evaluate_js(
+                self._ui_eval(
                     f"window.setToolActivity && window.setToolActivity("
                     f"{json.dumps(name)}, {'true' if active else 'false'})"
                 )
@@ -587,7 +704,7 @@ class VisionLive:
             safe_code = json.dumps(code)
             safe_lang = json.dumps(language)
             try:
-                self.ui_window.evaluate_js(f"window.showCode && window.showCode({safe_code}, {safe_lang})")
+                self._ui_eval(f"window.showCode && window.showCode({safe_code}, {safe_lang})")
             except Exception:
                 pass
 
@@ -597,7 +714,7 @@ class VisionLive:
             safe_results = json.dumps(results)
             safe_images = json.dumps(images or [])
             try:
-                self.ui_window.evaluate_js(
+                self._ui_eval(
                     f"window.showSearchResults && window.showSearchResults({safe_query}, {safe_results}, {safe_images})"
                 )
             except Exception:
@@ -609,7 +726,7 @@ class VisionLive:
             safe_stdout = json.dumps(stdout or "")
             safe_stderr = json.dumps(stderr or "")
             try:
-                self.ui_window.evaluate_js(
+                self._ui_eval(
                     f"window.showExecutionResult && window.showExecutionResult"
                     f"({safe_code}, {safe_stdout}, {safe_stderr}, {'true' if success else 'false'})"
                 )
@@ -620,28 +737,28 @@ class VisionLive:
         if self.ui_window:
             safe_html = json.dumps(html)
             try:
-                self.ui_window.evaluate_js(f"window.renderWebpage && window.renderWebpage({safe_html})")
+                self._ui_eval(f"window.renderWebpage && window.renderWebpage({safe_html})")
             except Exception:
                 pass
 
     def _close_ui_visual_panel(self):
         if self.ui_window:
             try:
-                self.ui_window.evaluate_js("window.closeVisualPanel && window.closeVisualPanel()")
+                self._ui_eval("window.closeVisualPanel && window.closeVisualPanel()")
             except Exception:
                 pass
 
     def _set_ui_screen_active(self, active: bool):
         if self.ui_window:
             try:
-                self.ui_window.evaluate_js(f"window.setScreenActive && window.setScreenActive({'true' if active else 'false'})")
+                self._ui_eval(f"window.setScreenActive && window.setScreenActive({'true' if active else 'false'})")
             except Exception:
                 pass
 
     def _set_ui_camera_active(self, active: bool):
         if self.ui_window:
             try:
-                self.ui_window.evaluate_js(f"window.setCameraActive && window.setCameraActive({'true' if active else 'false'})")
+                self._ui_eval(f"window.setCameraActive && window.setCameraActive({'true' if active else 'false'})")
             except Exception:
                 pass
 
@@ -824,12 +941,18 @@ class VisionLive:
         print("[vision_live] Camera started.")
         cap = None
         try:
-            cap = await asyncio.to_thread(cv2.VideoCapture, 0)
+            # Opening the capture device can block indefinitely if another
+            # process holds the camera or the driver wedges.
+            cap = await asyncio.wait_for(
+                asyncio.to_thread(cv2.VideoCapture, 0), timeout=15
+            )
             if not cap.isOpened():
                 print("[vision_live] Could not open camera.")
                 return
             while self._camera_active:
-                ret, frame = await asyncio.to_thread(cap.read)
+                ret, frame = await asyncio.wait_for(
+                    asyncio.to_thread(cap.read), timeout=10
+                )
                 if not ret:
                     await asyncio.sleep(0.5)
                     continue
@@ -911,7 +1034,11 @@ class VisionLive:
             return types.FunctionResponse(id=fc.id, name=name, response={"result": {"success": True}})
 
         if name == "recall_memory":
-            results = semantic_search(args.get("query", ""), n_results=5)
+            # Embedding + vector query: off the loop like every other
+            # blocking tool call.
+            results = await asyncio.to_thread(
+                semantic_search, args.get("query", ""), 5
+            )
             return types.FunctionResponse(id=fc.id, name=name, response={"result": {"matches": results}})
 
         confirmation_token = args.pop("confirmation_token", None)
@@ -985,11 +1112,21 @@ class VisionLive:
 
     async def _check_mic_available(self) -> bool:
         try:
-            test_stream = await asyncio.to_thread(
-                sd.InputStream, samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16"
+            # Bounded: opening a CoreAudio stream can block indefinitely
+            # after a sleep/wake glitch, and this runs on every wake-word
+            # cycle -- a hang here makes VISION permanently deaf.
+            test_stream = await asyncio.wait_for(
+                asyncio.to_thread(
+                    sd.InputStream, samplerate=SEND_SAMPLE_RATE,
+                    channels=CHANNELS, dtype="int16",
+                ),
+                timeout=10,
             )
-            await asyncio.to_thread(test_stream.close)
+            await asyncio.wait_for(asyncio.to_thread(test_stream.close), timeout=10)
             return True
+        except asyncio.TimeoutError:
+            _log("MIC CHECK TIMED OUT — CoreAudio did not answer within 10s.")
+            return False
         except Exception as e:
             print(f"[vision_live] Mic unavailable: {e}")
             return False
@@ -1069,7 +1206,14 @@ class VisionLive:
                 continue
 
             try:
-                result = get_calendar_events(hours_ahead=1)
+                # osascript subprocess: blocks for as long as Calendar takes
+                # to answer, which must not be on the event loop.
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(get_calendar_events, 1), timeout=30
+                )
+            except asyncio.TimeoutError:
+                print("[vision_live] Proactive calendar check timed out")
+                continue
             except Exception as e:
                 print(f"[vision_live] Proactive check failed: {e}")
                 continue
@@ -1210,9 +1354,15 @@ class VisionLive:
             # VISION is talking to avoid it hearing its own voice.
             if self._headphones_mode or not self._is_speaking:
                 self._last_active_time = time.time()
+                # out_queue is bounded (maxsize=10). A bare put_nowait
+                # raises QueueFull *inside* the event-loop callback, where
+                # it is only ever reported through asyncio's exception
+                # handler -- which went nowhere before file logging existed.
+                # A persistently full queue is the first visible symptom of
+                # a wedged _send_realtime, so say so loudly and drop the
+                # frame instead of raising.
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": indata.tobytes(), "mime_type": "audio/pcm"},
+                    self._offer_mic_chunk, indata.tobytes()
                 )
 
         try:
@@ -1227,11 +1377,32 @@ class VisionLive:
             self._set_ui_status("mic_unavailable")
             raise
 
+    def _offer_mic_chunk(self, pcm: bytes):
+        """Queues a mic chunk for upload, dropping it if the uplink is
+        backed up. Runs on the event loop via call_soon_threadsafe."""
+        try:
+            self.out_queue.put_nowait({"data": pcm, "mime_type": "audio/pcm"})
+            if self._mic_drops:
+                _log(f"Mic uplink recovered after dropping {self._mic_drops} chunks.")
+                self._mic_drops = 0
+        except asyncio.QueueFull:
+            self._mic_drops += 1
+            # Powers of two so a sustained stall keeps reporting without
+            # writing a line for every 32ms chunk.
+            if self._mic_drops & (self._mic_drops - 1) == 0:
+                _log(f"MIC UPLINK BACKED UP — dropped {self._mic_drops} chunk(s); "
+                     f"send_realtime is not draining out_queue. "
+                     f"{self._hearing_state()}")
+        except Exception as e:
+            print(f"[vision_live] Mic chunk enqueue failed: {e}")
+
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            async with self._session_send_lock:
-                await self.session.send_realtime_input(media=msg)
+            await self._session_send(
+                "realtime audio",
+                lambda m=msg: self.session.send_realtime_input(media=m),
+            )
 
     async def _finish_speaking(self, generation):
         while self.audio_in_queue and self.audio_in_queue.qsize() > 0:
@@ -1324,11 +1495,13 @@ class VisionLive:
                 msg = await self._live_notification_queue.get()
                 while self._is_speaking or self._tool_call_in_progress or computer_control.is_session_active():
                     await asyncio.sleep(0.3)
-                async with self._session_send_lock:
-                    await self.session.send_client_content(
-                        turns=types.Content(role="user", parts=[types.Part(text=msg)]),
+                await self._session_send(
+                    "live notification",
+                    lambda m=msg: self.session.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part(text=m)]),
                         turn_complete=True,
-                    )
+                    ),
+                )
             except Exception as e:
                 print(f"[vision_live] Live notification delivery failed: {e}")
 
@@ -1367,15 +1540,22 @@ class VisionLive:
                         full_in = " ".join(in_buf).strip()
                         full_out = " ".join(out_buf).strip()
 
+                        # save_message hits SQLite and semantic_add runs a
+                        # sentence-transformers embedding plus a chromadb
+                        # write -- hundreds of ms of blocking work, on the
+                        # event loop, once per turn. A contended SQLite
+                        # lock here stalls audio in both directions.
                         if full_in:
                             self._set_ui_transcript("user", full_in, final=True)
                             print(f"You: {full_in}")
-                            save_message("user", full_in)
-                            semantic_add("user", full_in)
+                            asyncio.create_task(
+                                asyncio.to_thread(self._persist_turn, "user", full_in)
+                            )
                         if full_out:
                             print(f"VISION: {full_out}")
-                            save_message("assistant", full_out)
-                            semantic_add("assistant", full_out)
+                            asyncio.create_task(
+                                asyncio.to_thread(self._persist_turn, "assistant", full_out)
+                            )
                             self._set_ui_transcript("agent", full_out, final=True)
 
                         in_buf, out_buf = [], []
@@ -1392,8 +1572,23 @@ class VisionLive:
                                 self._set_ui_tool(fc.name, False)
                     finally:
                         self._tool_call_in_progress = False
-                    async with self._session_send_lock:
-                        await self.session.send_tool_response(function_responses=fn_responses)
+                    await self._session_send(
+                        "tool response",
+                        lambda r=fn_responses: self.session.send_tool_response(
+                            function_responses=r
+                        ),
+                    )
+
+    def _persist_turn(self, role: str, text: str):
+        """Blocking history write, always called via asyncio.to_thread."""
+        try:
+            save_message(role, text)
+        except Exception as e:
+            print(f"[vision_live] save_message failed: {e}")
+        try:
+            semantic_add(role, text)
+        except Exception as e:
+            print(f"[vision_live] semantic_add failed: {e}")
 
     async def _play_audio(self):
         stream = sd.RawOutputStream(
@@ -1404,7 +1599,21 @@ class VisionLive:
             while True:
                 chunk = await self.audio_in_queue.get()
                 self._agent_level = _rms_level(chunk)
-                await asyncio.to_thread(stream.write, chunk)
+                # RawOutputStream.write blocks until the device drains the
+                # buffer. If the output device goes away mid-session
+                # (headphones yanked, Bluetooth drop) that can block for
+                # good, permanently consuming a thread-pool worker and
+                # silently ending playback. Bound it so the task raises and
+                # _run_session reopens the stream on reconnect.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(stream.write, chunk),
+                        timeout=AUDIO_WRITE_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    _log(f"AUDIO OUTPUT STALLED — write blocked for "
+                         f"{AUDIO_WRITE_TIMEOUT}s. Output device likely gone.")
+                    raise
         finally:
             stream.stop()
             stream.close()
@@ -1422,7 +1631,10 @@ class VisionLive:
             user, agent = self._mic_level, self._agent_level
             quiet = user < 0.005 and agent < 0.005
             if not (quiet and was_quiet):
-                await asyncio.to_thread(self._set_ui_levels, user, agent)
+                # Direct call: _set_ui_levels only enqueues now, so the
+                # extra thread hop this used to need is pure overhead at
+                # 15 dispatches a second.
+                self._set_ui_levels(user, agent)
             was_quiet = quiet
 
             self._mic_level *= 0.5
@@ -1492,11 +1704,13 @@ class VisionLive:
                             )
                         context_note = "\n".join(context_parts)
 
-                        async with self._session_send_lock:
-                            await session.send_client_content(
-                                turns=types.Content(role="user", parts=[types.Part(text=context_note)]),
+                        await self._session_send(
+                            "startup directive",
+                            lambda n=context_note: session.send_client_content(
+                                turns=types.Content(role="user", parts=[types.Part(text=n)]),
                                 turn_complete=True,
-                            )
+                            ),
+                        )
                         greeted = True
 
                     tasks = [
@@ -1554,6 +1768,16 @@ class VisionLive:
         print("[vision_live] Session ended.\n")
 
     async def run(self):
+        # asyncio reports some failures only through its exception handler
+        # -- notably anything raised inside a call_soon_threadsafe callback
+        # -- and by default those go to a stderr that does not exist in a
+        # packaged .app.
+        vision_logging.install_asyncio_exception_handler(asyncio.get_running_loop())
+        # Feeds the freeze watchdog. If this stops ticking, the event loop
+        # is blocked, and the watchdog dumps every thread's stack to the
+        # log -- the only evidence a hang ever leaves behind.
+        asyncio.create_task(vision_logging.heartbeat_loop())
+
         asyncio.create_task(self._proactive_monitor_loop())
         asyncio.create_task(slack_control.run_slack_listener(self._on_relevant_slack_event))
         asyncio.create_task(self._auto_mute_idle_watcher())
@@ -1576,6 +1800,7 @@ class VisionLive:
 
 
 def main():
+    vision_logging.setup("vision_live")
     init_db()
     live = VisionLive()
     try:

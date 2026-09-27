@@ -99,6 +99,45 @@ Starting a GUI-automation task (`start_computer_use`) normally requires a one-ti
 
 **Known accepted risk tradeoff:** a short whitelist of apps (`BENIGN_APPS` in `system_control/computer_control.py`) lets tasks start with *no* confirmation at all when one of those apps is already frontmost. This trades safety for convenience for low-stakes apps (media players, browsers) — edit that list directly if you want to change the balance. There's currently no ongoing check of which app is frontmost *during* an already-active session, so a confirmed (or whitelisted) session isn't restricted to staying inside the app that justified it. If you want tighter guarantees here, that's the first thing to change.
 
+## Diagnostics
+
+VISION writes real log files, which matters most in the packaged `.app`
+where there is no terminal attached and `print()` output would otherwise
+go to `/dev/null`.
+
+    ~/Library/Application Support/VISION/logs/     # packaged .app
+    logs/                                          # running from source
+
+| File | What lands in it |
+| --- | --- |
+| `vision.log` | Everything the app prints, plus uncaught exceptions on any thread, asyncio errors, and thread dumps. Rotates at 8 MB, 3 kept. |
+| `vision-native.log` | Output written straight to fds 1/2 by compiled dependencies (whisper.cpp, PortAudio, OpenCV, WebKit), which never passes through Python. Packaged builds only. |
+| `vision-faulthandler.log` | C-level tracebacks for a hard native crash. |
+
+### If VISION freezes
+
+A hang leaves no crash report, so the evidence has to be collected while
+it is still stuck. A watchdog thread does this automatically: it watches a
+heartbeat the event loop updates every second, and after
+`LOOP_STALL_SECONDS` without a tick it dumps every thread's stack to
+`vision.log` under `===== THREAD DUMP =====`. Read that first — it names
+the exact blocking call.
+
+To force a dump by hand while the app is wedged, without killing it:
+
+    kill -USR1 $(pgrep -f VISION)    # C stacks      -> vision-faulthandler.log
+    kill -USR2 $(pgrep -f VISION)    # Python stacks -> vision.log
+
+Prefer `-USR1`: it is a real C signal handler and fires even when the main
+thread is buried in Cocoa's native run loop. `-USR2` runs a Python-level
+handler, which only executes between bytecode instructions on the main
+thread, so it can be delayed or miss entirely in exactly the case you most
+want it. The automatic watchdog does not have this problem — it runs on
+its own thread.
+
+Both leave the process running, so you can dump more than once to tell a
+deadlock (identical stacks) from a slow loop (moving stacks).
+
 ## Testing
 
 ```bash

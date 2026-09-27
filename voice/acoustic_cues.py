@@ -6,10 +6,19 @@ stops talking, "success"/"error" chirps after a tool result, "waiting"
 for a longer-running action. Pure stdlib tone synthesis, no new dependency
 and no external sound-asset files.
 
-Deliberately plays via a one-shot sd.play() call rather than the
-persistent RawOutputStream vision_live.py uses for Gemini's own audio
-output, so cues never contend with or interleave into that stream.
+Each cue plays on its own short-lived RawOutputStream, separate from the
+persistent one vision_live.py uses for Gemini's own audio, so cues never
+contend with or interleave into that stream.
+
+Deliberately NOT sd.play(): play()/rec() share one global stream slot
+(sounddevice._last_callback), and every play() first closes whatever stream
+is in it. Cues fire from asyncio.to_thread workers while stt.record_audio()
+closes its own sd.rec() stream on another thread, so two threads could call
+Pa_CloseStream on the same pointer -- a double free that SIGABRTs the whole
+app (the 2026-09-24 crash). A private stream is never touched by anyone else.
 """
+
+import threading
 
 import math
 from array import array
@@ -28,6 +37,10 @@ CUE_PRESETS = {
 }
 
 _cache: dict[str, array] = {}
+
+# Serializes cues so a burst ("waiting" then "success") plays in order
+# instead of opening overlapping output streams.
+_play_lock = threading.Lock()
 
 
 def _synth_tone(freq_start: float, freq_end: float, duration_s: float, volume: float) -> array:
@@ -51,8 +64,8 @@ def _synth_tone(freq_start: float, freq_end: float, duration_s: float, volume: f
 
 
 def play_acoustic_cue(cue_type: str) -> None:
-    """Synthesizes (or reuses a cached) short tone and plays it immediately,
-    non-blocking. Unknown cue_type is a silent no-op rather than an error —
+    """Synthesizes (or reuses a cached) short tone and plays it, blocking for
+    the ~0.2s it lasts -- every call site runs this via asyncio.to_thread. Unknown cue_type is a silent no-op rather than an error —
     an acoustic cue should never be the thing that breaks a call site."""
     if cue_type not in CUE_PRESETS:
         print(f"[acoustic_cues] Unknown cue_type: {cue_type}")
@@ -62,6 +75,9 @@ def play_acoustic_cue(cue_type: str) -> None:
         _cache[cue_type] = _synth_tone(*CUE_PRESETS[cue_type])
 
     try:
-        sd.play(_cache[cue_type], samplerate=SAMPLE_RATE, blocking=False)
+        with _play_lock, sd.RawOutputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+        ) as stream:
+            stream.write(_cache[cue_type].tobytes())
     except Exception as e:
         print(f"[acoustic_cues] Playback failed: {e}")
