@@ -95,7 +95,6 @@ OPTIONS = {
         "slack_sdk",
         "dotenv",
         "requests",
-        "openai",
     ],
     "includes": [
         # Resolved through modulegraph's real import machinery, which does

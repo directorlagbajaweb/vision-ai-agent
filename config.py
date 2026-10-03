@@ -66,9 +66,6 @@ MEMORY_DB_PATH = DATA_DIR / "memory" / "vision.db"
 LOG_FILE_PATH = DATA_DIR / "logs" / "vision.log"
 
 # ── API Keys (loaded from .env) ──────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")   # optional, added later
-PORCUPINE_API_KEY = os.getenv("PORCUPINE_API_KEY")     # optional, added later
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
@@ -77,43 +74,16 @@ SLACK_USER_TOKEN = os.getenv("SLACK_USER_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 SLACK_USER_ID = os.getenv("SLACK_USER_ID")
 
-# ── OpenRouter Settings ───────────────────────────────
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 USER_NAME = "David"
 
-# ── Model Routing ─────────────────────────────────────
-# Free-first, paid-fallback chains.
-# router.py decides WHICH chain to use (coding vs everyday).
-# model_fallback.py walks each chain top to bottom until one responds.
-
-CODING_MODEL_CHAIN = [
-    "openrouter/free",                     # auto free-tier selector, tried first
-    "deepseek/deepseek-v4-flash",          # cheap paid fallback (~$0.09/M input)
-    "z-ai/glm-5.2",                        # stronger paid fallback for hard tasks
-]
-
-EVERYDAY_MODEL_CHAIN = [
-    "openrouter/free",                     # auto free-tier selector, tried first
-    "google/gemini-2.5-flash-lite",        # cheap paid fallback
-    "deepseek/deepseek-v4-flash",          # secondary fallback
+# ── Models ────────────────────────────────────────────
+# Non-live Gemini models for one-shot text jobs (Slack catch-up summaries),
+# tried in order -- the first often returns 503 under high demand.
+SUMMARY_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
 ]
 
 # ── Wake Word ─────────────────────────────────────────
 WAKE_WORD = "vision"          # phrase VISION listens for
 WAKE_WORD_SENSITIVITY = 0.5   # 0.0 (strict) to 1.0 (loose)
-
-# ── App Behavior ──────────────────────────────────────
-MAX_FALLBACK_ATTEMPTS = 3     # how many models to try before giving up
-REQUEST_TIMEOUT_SECONDS = 30  # per-model timeout before falling back
-
-# ── Sanity check on startup ───────────────────────────
-def validate_config():
-    """Called by main.py at startup to catch missing keys early."""
-    missing = []
-    if not OPENROUTER_API_KEY:
-        missing.append("OPENROUTER_API_KEY")
-    if missing:
-        raise EnvironmentError(
-            f"Missing required environment variable(s): {', '.join(missing)}. "
-            f"Check your .env file."
-        )

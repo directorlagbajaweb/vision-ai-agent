@@ -25,7 +25,6 @@ Built on Gemini Live for native, low-latency voice-to-voice conversation (not a 
 - API keys:
   - `GEMINI_API_KEY` — **required**, powers the entire voice pipeline (Gemini Live)
   - `TAVILY_API_KEY` — required for the `web_search` tool to work
-  - `OPENROUTER_API_KEY` — only needed if you run the experimental text-chat pipeline (`brain/router.py`) directly; not used by the app you actually launch
 - macOS permissions (grant these in **System Settings → Privacy & Security**):
   - **Microphone** — for voice input
   - **Screen Recording** — for screenshots and screen-watching
@@ -47,7 +46,6 @@ Create a `.env` file in the project root:
 ```
 GEMINI_API_KEY=your_key_here
 TAVILY_API_KEY=your_key_here
-OPENROUTER_API_KEY=your_key_here   # optional, legacy pipeline only
 ```
 
 Then grant the macOS permissions listed above to whichever app/terminal launches Python (System Settings → Privacy & Security), and run:
@@ -82,15 +80,12 @@ system_control/
   code_exec.py             Sandboxed-ish Python execution
   web_search.py            Tavily web search
 
-brain/                     Experimental text-chat pipeline (OpenRouter) — real code,
-                            but NOT wired into main.py; kept for future use
 memory/
   db.py                    SQLite conversation history + durable facts
   semantic.py               Chroma-based semantic search over past conversations
 
 ui/
   static/                  The HUD: index.html, style.css, app.js (visualizer + transcript)
-  ui.py                    Alternate pywebview entry point (bridges to brain/, unused by main.py)
 ```
 
 ## Computer Use: how the safety model works
@@ -148,4 +143,4 @@ Verifies the confirmation-token flow, coordinate math, and the app whitelist —
 
 ## Status
 
-This is an actively evolving personal project, not a polished release. The `brain/` text-chat pipeline exists in the repo but isn't part of the app you actually run — everything under `voice/` is what's live.
+This is an actively evolving personal project, not a polished release.

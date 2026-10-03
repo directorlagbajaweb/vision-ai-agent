@@ -1,6 +1,5 @@
 # Core
 python-dotenv
-openai
 
 # UI
 pywebview

@@ -22,6 +22,8 @@ import ssl
 from datetime import datetime, timedelta
 
 import certifi
+from google import genai
+from google.genai import types
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.aiohttp import SocketModeClient
@@ -30,7 +32,6 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web.async_client import AsyncWebClient
 
 import config
-from brain.model_fallback import get_response
 
 # Two separate clients, matching each call site's actual execution context:
 # the async one is used from the Socket Mode event loop directly (no
@@ -39,6 +40,7 @@ from brain.model_fallback import get_response
 # live pipeline -- matches every other registered action's calling convention.
 _async_web_client = None
 _sync_web_client = None
+_genai_client = None
 
 _user_name_cache = {}
 _channel_name_cache = {}
@@ -59,6 +61,9 @@ SOCKET_CONNECT_TIMEOUT = 30
 # generous and these calls sit on the path that delivers a DM into a live
 # conversation.
 SLACK_API_TIMEOUT = 20
+# Same deadline for the Gemini call that writes a catch-up summary -- it
+# runs on a thread a voice turn is waiting on.
+SUMMARY_TIMEOUT = 20
 
 
 def _get_async_web_client():
@@ -69,6 +74,16 @@ def _get_async_web_client():
             timeout=SLACK_API_TIMEOUT,
         )
     return _async_web_client
+
+
+def _get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client(
+            api_key=config.GEMINI_API_KEY,
+            http_options=types.HttpOptions(timeout=SUMMARY_TIMEOUT * 1000),
+        )
+    return _genai_client
 
 
 def _get_sync_web_client():
@@ -428,27 +443,28 @@ def _summarize_catch_up(label: str, lines: list, hit_cap: bool):
         if hit_cap
         else ""
     )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You summarize Slack conversation history for someone who wasn't present. "
-                "Be concise and conversational -- this will be read aloud, not displayed as "
-                "text. Cover the key points and who said what, and clearly call out anything "
-                "that seems to need the listener's attention: a direct question to them, a "
-                "decision that was made, a deadline, an action item. If nothing needs their "
-                "attention, say so plainly instead of inventing something."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Slack history for {label}:\n\n{transcript}{truncation_note}",
-        },
-    ]
-    result = get_response(messages, config.EVERYDAY_MODEL_CHAIN)
-    if not result["success"]:
-        return None
-    return result["message"].content
+    for model in config.SUMMARY_MODELS:
+        try:
+            response = _get_genai_client().models.generate_content(
+                model=model,
+                contents=f"Slack history for {label}:\n\n{transcript}{truncation_note}",
+                config=types.GenerateContentConfig(
+                    system_instruction=(
+                        "You summarize Slack conversation history for someone who wasn't present. "
+                        "Be concise and conversational -- this will be read aloud, not displayed as "
+                        "text. Cover the key points and who said what, and clearly call out anything "
+                        "that seems to need the listener's attention: a direct question to them, a "
+                        "decision that was made, a deadline, an action item. If nothing needs their "
+                        "attention, say so plainly instead of inventing something."
+                    ),
+                ),
+            )
+        except Exception as e:
+            print(f"[slack_control] Catch-up summary failed on {model}: {e}")
+            continue
+        if response.text:
+            return response.text
+    return None
 
 
 def slack_catch_me_up(channel_or_person: str, time_range: str = "today") -> dict:
