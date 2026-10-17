@@ -54,12 +54,19 @@ function setStatus(state) {
   statePill.title = state;
   agentHint.textContent = info.hint;
 
-  const muted = state === 'muted';
+  // Only states that say something about the mic move the button. VISION
+  // can think and speak while muted (typed messages), and those states
+  // must not flip it back to "Mic on".
+  if (state === 'muted') setMicButton(true);
+  else if (state === 'listening' || state === 'idle') setMicButton(false);
+}
+
+function setMicButton(muted) {
+  isMuted = muted;
   micBtn.classList.toggle('muted', muted);
   micBtn.setAttribute('aria-pressed', String(muted));
   micLabel.textContent = muted ? 'Mic off' : 'Mic on';
   micBtn.title = muted ? 'Unmute VISION' : 'Mute VISION';
-  isMuted = muted;
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +204,27 @@ function updateTranscript(role, text, final) {
     streaming[role] = null;
     lastFinal[role] = value;
   }
+  scrollToEnd(false);
+}
+
+/* A typed message. Its own bubble every time, outside updateTranscript's
+   duplicate check, so sending the same text twice shows twice. */
+function addTypedTurn(text) {
+  const turn = makeTurn('user');
+  turn.classList.remove('streaming');
+  turn.classList.add('typed');
+  turn._text.textContent = text;
+  appendEntry(turn);
+  scrollToEnd(true);
+  return turn;
+}
+
+function markNotSent(turn, reason) {
+  turn.classList.add('failed');
+  const note = document.createElement('div');
+  note.className = 'turn-note';
+  note.textContent = 'Not sent' + (reason ? ' · ' + reason : '');
+  turn.appendChild(note);
   scrollToEnd(false);
 }
 
@@ -352,7 +380,9 @@ let isMuted = false;
 micBtn.addEventListener('click', async () => {
   isMuted = !isMuted;
   // Optimistic — the backend echoes the real state back through updateStatus.
-  setStatus(isMuted ? 'muted' : 'listening');
+  // Mid-reply only the button changes; the state pill stays truthful.
+  if (currentState === 'speaking' || currentState === 'processing') setMicButton(isMuted);
+  else setStatus(isMuted ? 'muted' : 'listening');
 
   if (window.pywebview && window.pywebview.api && window.pywebview.api.toggle_mute) {
     try {
@@ -369,6 +399,55 @@ clearBtn.addEventListener('click', () => {
   streaming.agent = null;
   lastFinal = { user: '', agent: '' };
   emptyState.classList.remove('hidden');
+});
+
+/* ------------------------------------------------------------------ */
+/* Chat panel                                                          */
+/* ------------------------------------------------------------------ */
+
+const chatForm  = el('chat-form');
+const chatInput = el('chat-input');
+const chatSend  = el('chat-send');
+const CHAT_MAX_HEIGHT = 120;
+
+function resizeChatInput() {
+  chatInput.style.height = 'auto';
+  chatInput.style.height = Math.min(chatInput.scrollHeight, CHAT_MAX_HEIGHT) + 'px';
+  chatSend.disabled = !chatInput.value.trim();
+}
+
+async function sendTyped() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  chatInput.value = '';
+  resizeChatInput();
+
+  const turn = addTypedTurn(text);
+  const api = window.pywebview && window.pywebview.api;
+  if (!api || !api.send_text) {
+    markNotSent(turn, 'not connected');
+    return;
+  }
+  try {
+    const result = await api.send_text(text);
+    if (!result || !result.ok) markNotSent(turn, result && result.error);
+  } catch (e) {
+    console.error('send_text failed:', e);
+    markNotSent(turn, 'bridge error');
+  }
+}
+
+chatInput.addEventListener('input', resizeChatInput);
+chatInput.addEventListener('keydown', (e) => {
+  // Enter sends, Shift+Enter is a newline; never send mid-IME composition.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    sendTyped();
+  }
+});
+chatForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  sendTyped();
 });
 
 /* ------------------------------------------------------------------ */

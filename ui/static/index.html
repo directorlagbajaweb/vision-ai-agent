@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>VISION</title>
-  <link rel="stylesheet" href="style.css?v=5">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
 <body data-state="idle">
 
@@ -33,6 +33,16 @@
       </div>
       <div class="transcript-feed" id="transcript-feed"></div>
     </main>
+
+    <form class="chatbar" id="chat-form" autocomplete="off">
+      <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message…" aria-label="Message VISION"></textarea>
+      <button id="chat-send" class="chat-send" type="submit" title="Send (Enter)" aria-label="Send" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 19V5"></path>
+          <path d="M6 11l6-6 6 6"></path>
+        </svg>
+      </button>
+    </form>
 
     <footer class="controlbar">
       <button id="mic-btn" class="mic-btn" type="button" title="Mute VISION" aria-pressed="false">
@@ -72,6 +82,6 @@
     <iframe id="page-frame" class="overlay-frame" sandbox="allow-scripts"></iframe>
   </div>
 
-  <script src="app.js?v=5"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>
