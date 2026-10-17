@@ -52,6 +52,11 @@ class VisionAPI:
             self.live.set_muted(muted)
         return {"muted": muted}
 
+    def send_text(self, text: str):
+        if not self.live:
+            return {"ok": False, "error": "VISION is still starting"}
+        return self.live.submit_text(text)
+
 
 def start_voice_backend(window, api):
     # Runs on a pywebview worker thread, not the main thread.

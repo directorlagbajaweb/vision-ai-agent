@@ -360,6 +360,58 @@ body[data-state="reconnecting"] .state-dot { animation: pulse .8s ease-in-out in
   white-space: nowrap;
 }
 
+/* ---------- chat bar ---------- */
+
+.chatbar {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.chat-input {
+  flex: 1;
+  min-width: 0;
+  max-height: 120px;
+  padding: 8px 13px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--surface-2);
+  color: var(--fg);
+  font: inherit;
+  line-height: 1.45;
+  resize: none;
+  outline: none;
+  user-select: text;
+  transition: border-color .2s ease;
+}
+.chat-input::placeholder { color: var(--fg-faint); }
+.chat-input:focus { border-color: var(--accent); }
+
+.chat-send {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  transition: opacity .2s ease, background .2s ease;
+}
+.chat-send svg { width: 17px; height: 17px; }
+.chat-send:disabled { opacity: .3; cursor: default; }
+
+.turn-note {
+  font-size: 11px;
+  color: var(--danger);
+}
+.turn.failed .turn-text { opacity: .6; border-color: rgba(244,104,95,.4); }
+
 /* ---------- control bar ---------- */
 
 .controlbar {

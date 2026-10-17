@@ -536,6 +536,12 @@ class VisionLive:
         self._camera_task = None
         self._proactive_trigger = asyncio.Event()
         self._proactive_message = None
+        # Chat panel: a message typed while dormant waits here for the
+        # session it wakes. _awaiting_typed_reply keeps the HUD on
+        # "thinking" from the send until VISION starts answering.
+        self._pending_typed = None
+        self._awaiting_typed_reply = False
+        self._loop = None               # set in run(); the HUD bridge thread posts onto it
         self._notified_events = set()
         self._headphones_mode = False
         self._mic_level = 0.0
@@ -776,6 +782,92 @@ class VisionLive:
         _log(f"MANUAL {'MUTE' if muted else 'UNMUTE'} (HUD button) — {self._hearing_state()}")
         state = "muted" if muted else ("listening" if self._active else "idle")
         self._set_ui_status(state)
+
+    def _resting_status(self) -> str:
+        """What the HUD shows once VISION stops talking."""
+        if self._awaiting_typed_reply:
+            return "processing"
+        return "muted" if self._muted else "listening"
+
+    def submit_text(self, text: str) -> dict:
+        """Chat panel entry point. Called on a pywebview bridge thread, so
+        it only hands the message to the event loop and waits for the
+        verdict -- nothing here touches the session directly."""
+        text = (text or "").strip()
+        if not text:
+            return {"ok": False, "error": "empty message"}
+        if not self._loop:
+            return {"ok": False, "error": "VISION is still starting"}
+        future = asyncio.run_coroutine_threadsafe(self._send_typed(text), self._loop)
+        try:
+            return future.result(timeout=SESSION_SEND_LOCK_TIMEOUT + SESSION_SEND_TIMEOUT + 5)
+        except Exception as e:
+            future.cancel()
+            _log(f"typed message not sent: {e!r}")
+            return {"ok": False, "error": "send timed out"}
+
+    async def _send_typed(self, text: str) -> dict:
+        """Runs as its own task, outside _run_session's FIRST_COMPLETED set,
+        so a failed send reports "not sent" instead of forcing a reconnect."""
+        _log(f"TYPED MESSAGE ({len(text)} chars) — {self._hearing_state()}")
+        self._last_active_time = time.time()
+
+        if not self._active:
+            # Dormant: wake through the same trigger Slack/calendar use;
+            # _run_session sends the text in place of the greeting.
+            # Several messages typed while it's still connecting go as one turn.
+            self._pending_typed = f"{self._pending_typed}\n{text}" if self._pending_typed else text
+            self._awaiting_typed_reply = True
+            self._proactive_trigger.set()
+            self._set_ui_status("processing")
+            return {"ok": True, "woke": True}
+
+        if not self.session:
+            return {"ok": False, "error": "not connected"}
+
+        if self._muted_auto:
+            self._disengage_auto_mute()
+
+        self._awaiting_typed_reply = True
+        barge_in = self._is_speaking
+        if barge_in:
+            # Several seconds of reply audio can already be buffered here,
+            # beyond anything the server can take back -- stop it locally.
+            self._drain_playback()
+            self._is_speaking = False
+        try:
+            if barge_in:
+                # A client turn alone does NOT interrupt the native-audio
+                # model -- it queues behind the reply (tested). A realtime
+                # text input does, and the server answers `interrupted`,
+                # which _handle_interruption handles as for a voice barge-in.
+                await self._session_send(
+                    "typed barge-in", lambda: self.session.send_realtime_input(text=" ")
+                )
+            await self._session_send("typed message", lambda: self._send_user_text(text))
+        except Exception as e:
+            self._awaiting_typed_reply = False
+            self._set_ui_status(self._resting_status())
+            _log(f"typed message send failed: {e!r}")
+            return {"ok": False, "error": "send failed"}
+
+        self._set_ui_status("processing")
+        asyncio.create_task(asyncio.to_thread(self._persist_turn, "user", text))
+        return {"ok": True}
+
+    def _drain_playback(self):
+        while self.audio_in_queue and not self.audio_in_queue.empty():
+            try:
+                self.audio_in_queue.get_nowait()
+            except Exception:
+                break
+
+    def _send_user_text(self, text: str):
+        # A complete client turn -- the path the model reliably answers.
+        return self.session.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(text=text)]),
+            turn_complete=True,
+        )
 
     def _play_system_sound(self, name: str):
         """Short native macOS system sounds for auto-mute events -- deliberately
@@ -1322,6 +1414,8 @@ class VisionLive:
 
         if proactive_task in done:
             self._proactive_trigger.clear()
+            if self._pending_typed:
+                return "typed"
             self._set_ui_status("idle")
             return "proactive"
 
@@ -1414,17 +1508,13 @@ class VisionLive:
             return
         self._is_speaking = False
         self._last_active_time = time.time()
-        self._set_ui_status("muted" if self._muted else "listening")
+        self._set_ui_status(self._resting_status())
 
     async def _handle_interruption(self, out_buf=None):
         """Called when Gemini's server reports the user barged in mid-response."""
         print("[vision_live] User interrupted — stopping playback immediately.")
         # Drain any queued audio so playback stops right away
-        while self.audio_in_queue and not self.audio_in_queue.empty():
-            try:
-                self.audio_in_queue.get_nowait()
-            except Exception:
-                break
+        self._drain_playback()
 
         if out_buf:
             partial = " ".join(out_buf).strip()
@@ -1436,7 +1526,7 @@ class VisionLive:
 
         self._is_speaking = False
         self._last_active_time = time.time()
-        self._set_ui_status("listening")
+        self._set_ui_status(self._resting_status())
 
     async def _maybe_signal_processing(self, chunk_time):
         """Debounced "user has likely finished talking" detector. There's no
@@ -1527,6 +1617,7 @@ class VisionLive:
                         asyncio.create_task(self._maybe_signal_processing(self._last_input_chunk_at))
 
                     if sc.output_transcription and sc.output_transcription.text:
+                        self._awaiting_typed_reply = False
                         if not self._is_speaking:
                             self._set_ui_status("speaking")
                         self._is_speaking = True
@@ -1640,7 +1731,7 @@ class VisionLive:
             self._mic_level *= 0.5
             self._agent_level *= 0.5
 
-    async def _run_session(self, proactive_message: str = None):
+    async def _run_session(self, proactive_message: str = None, typed_message: str = None):
         """Stays active for as long as the process is online. A crash or
         dropped connection in any of the core tasks reconnects automatically
         (showing "reconnecting") rather than falling back to dormant/idle —
@@ -1696,6 +1787,12 @@ class VisionLive:
                                 f"Naturally tell {config.USER_NAME} what you noticed, briefly, "
                                 f"then ask if they need anything. Do not mention this directive."
                             )
+                        elif typed_message:
+                            context_parts.append(
+                                f"{config.USER_NAME} woke you by typing in the chat panel. "
+                                f"Their message is the next turn: answer it directly, with no "
+                                f"greeting. Do not mention this directive.]"
+                            )
                         else:
                             context_parts.append(
                                 f"Greet {config.USER_NAME} warmly and briefly by name, referencing "
@@ -1704,13 +1801,25 @@ class VisionLive:
                             )
                         context_note = "\n".join(context_parts)
 
+                        # With a typed message the directive is only context
+                        # (turn_complete=False) -- the typed turn that
+                        # follows is what VISION answers.
                         await self._session_send(
                             "startup directive",
                             lambda n=context_note: session.send_client_content(
                                 turns=types.Content(role="user", parts=[types.Part(text=n)]),
-                                turn_complete=True,
+                                turn_complete=not typed_message,
                             ),
                         )
+                        if typed_message:
+                            await self._session_send(
+                                "typed message",
+                                lambda t=typed_message: self._send_user_text(t),
+                            )
+                            self._set_ui_status("processing")
+                            asyncio.create_task(
+                                asyncio.to_thread(self._persist_turn, "user", typed_message)
+                            )
                         greeted = True
 
                     tasks = [
@@ -1772,7 +1881,8 @@ class VisionLive:
         # -- notably anything raised inside a call_soon_threadsafe callback
         # -- and by default those go to a stderr that does not exist in a
         # packaged .app.
-        vision_logging.install_asyncio_exception_handler(asyncio.get_running_loop())
+        self._loop = asyncio.get_running_loop()
+        vision_logging.install_asyncio_exception_handler(self._loop)
         # Feeds the freeze watchdog. If this stops ticking, the event loop
         # is blocked, and the watchdog dumps every thread's stack to the
         # log -- the only evidence a hang ever leaves behind.
@@ -1786,7 +1896,11 @@ class VisionLive:
         while True:
             try:
                 trigger = await self._wait_for_wake_phrase()
-                if trigger == "proactive":
+                if trigger == "typed":
+                    text = self._pending_typed
+                    self._pending_typed = None
+                    await self._run_session(typed_message=text)
+                elif trigger == "proactive":
                     msg = self._proactive_message
                     self._proactive_message = None
                     await self._run_session(proactive_message=msg)
