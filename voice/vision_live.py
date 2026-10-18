@@ -19,6 +19,7 @@ import tempfile
 import threading
 import traceback
 import subprocess
+import concurrent.futures
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -68,6 +69,9 @@ CAMERA_CAPTURE_INTERVAL = 2.0
 SESSION_SEND_TIMEOUT = 20.0      # a single send_* on the Live websocket
 SESSION_SEND_LOCK_TIMEOUT = 30.0 # waiting for another task's send to finish
 AUDIO_WRITE_TIMEOUT = 10.0       # one blocking write to the output device
+AUDIO_OPEN_TIMEOUT = 10.0        # opening (and starting) a PortAudio stream
+AUDIO_CLOSE_TIMEOUT = 5.0        # stopping and closing a PortAudio stream
+MIC_REOPEN_DELAY = 2.0           # pause between attempts to reopen the mic
 UI_EVAL_TIMEOUT = 5.0            # one evaluate_js round-trip into the HUD
 # Beyond this many queued HUD updates the bridge is presumed wedged and
 # further updates are dropped rather than queued forever. The HUD is a
@@ -503,6 +507,103 @@ def is_headphones_active() -> bool:
     except Exception as e:
         print(f"[vision_live] Could not detect output device: {e}")
         return False
+
+
+# Streams whose stop/close never returned. PortAudio may still be invoking
+# their cffi callback from its own audio thread, so they must never be
+# garbage collected: freeing the callback underneath it is a native crash.
+_abandoned_streams = []
+
+
+def _audio_call(fn, what: str) -> concurrent.futures.Future:
+    """Runs one blocking PortAudio call on its own daemon thread.
+
+    Opening, starting, stopping and closing a stream all block with no
+    timeout of their own (Pa_StopStream waits on the CoreAudio IO thread),
+    and none of them may ever run on the event loop thread: one hang there
+    freezes the entire voice pipeline, which is exactly what the watchdog
+    caught in sounddevice's InputStream.__exit__ -> stop(). A daemon thread
+    rather than asyncio.to_thread for the same reason as the HUD bridge --
+    a call that never returns would pin a default-executor worker forever,
+    and the executor joins its workers at exit, so Cmd+Q would hang too."""
+    cf = concurrent.futures.Future()
+
+    def run():
+        if not cf.set_running_or_notify_cancel():
+            return
+        try:
+            cf.set_result(fn())
+        except BaseException as e:
+            cf.set_exception(e)
+
+    threading.Thread(target=run, name=f"vision-audio-{what}", daemon=True).start()
+    return cf
+
+
+def _discard_late_stream(cf: concurrent.futures.Future):
+    """Done-callback for an open nobody is waiting on any more: if it did
+    eventually produce a stream, close it -- on yet another daemon thread,
+    because this callback can run on the event loop thread."""
+    if cf.cancelled() or cf.exception() is not None:
+        return
+    stream = cf.result()
+    _audio_call(stream.close, "late-close")
+
+
+async def _open_audio_stream(make_stream, what: str, start: bool = True):
+    """Creates (and by default starts) a stream off the loop thread, bounded
+    by AUDIO_OPEN_TIMEOUT. Raises TimeoutError if CoreAudio never answers."""
+    def open_stream():
+        stream = make_stream()
+        if start:
+            try:
+                stream.start()
+            except BaseException:
+                stream.close()
+                raise
+        return stream
+
+    cf = _audio_call(open_stream, f"{what}-open")
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(cf), timeout=AUDIO_OPEN_TIMEOUT)
+    except asyncio.TimeoutError:
+        _log(f"AUDIO OPEN TIMED OUT — the {what} stream did not open within "
+             f"{AUDIO_OPEN_TIMEOUT}s. CoreAudio is not answering.")
+        cf.add_done_callback(_discard_late_stream)
+        raise
+    except asyncio.CancelledError:
+        cf.add_done_callback(_discard_late_stream)
+        raise
+
+
+async def _close_audio_stream(stream, what: str) -> bool:
+    """Stops and closes a stream off the loop thread, bounded by
+    AUDIO_CLOSE_TIMEOUT. On timeout the stream is abandoned -- never touched
+    again, but kept referenced -- and False is returned; the caller carries
+    on and opens a fresh stream instead of staying wedged on this one."""
+    def stop_and_close():
+        try:
+            stream.stop()
+        finally:
+            stream.close()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.wrap_future(_audio_call(stop_and_close, f"{what}-close")),
+            timeout=AUDIO_CLOSE_TIMEOUT,
+        )
+        return True
+    except asyncio.TimeoutError:
+        _abandoned_streams.append(stream)
+        _log(f"AUDIO CLOSE TIMED OUT — PortAudio did not stop the {what} stream "
+             f"within {AUDIO_CLOSE_TIMEOUT}s. Abandoning it "
+             f"({len(_abandoned_streams)} abandoned so far); its thread stays "
+             f"blocked, but the event loop does not.")
+        vision_logging.dump_all_stacks(f"{what} stream close timed out")
+        return False
+    except Exception as e:
+        print(f"[vision_live] Closing the {what} stream failed: {e!r}")
+        return True
 
 
 class VisionLive:
@@ -1207,15 +1308,13 @@ class VisionLive:
             # Bounded: opening a CoreAudio stream can block indefinitely
             # after a sleep/wake glitch, and this runs on every wake-word
             # cycle -- a hang here makes VISION permanently deaf.
-            test_stream = await asyncio.wait_for(
-                asyncio.to_thread(
-                    sd.InputStream, samplerate=SEND_SAMPLE_RATE,
-                    channels=CHANNELS, dtype="int16",
+            test_stream = await _open_audio_stream(
+                lambda: sd.InputStream(
+                    samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
                 ),
-                timeout=10,
+                "mic check", start=False,
             )
-            await asyncio.wait_for(asyncio.to_thread(test_stream.close), timeout=10)
-            return True
+            return await _close_audio_stream(test_stream, "mic check")
         except asyncio.TimeoutError:
             _log("MIC CHECK TIMED OUT — CoreAudio did not answer within 10s.")
             return False
@@ -1423,9 +1522,54 @@ class VisionLive:
         return "wake_phrase"
 
     async def _listen_audio_awake(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        failures = 0
+        while True:
+            # Cleared before the stream is closed or given up on. A stream
+            # whose close hangs (or whose open finishes after we stopped
+            # waiting) may keep firing its callback, and it must never feed
+            # stale audio into this session or a later one.
+            capturing = threading.Event()
+            capturing.set()
+            try:
+                stream = await _open_audio_stream(
+                    lambda cb=self._make_mic_callback(loop, capturing): sd.InputStream(
+                        samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                        blocksize=CHUNK_SIZE, callback=cb,
+                    ),
+                    "mic",
+                )
+            except Exception as e:
+                # Retry in place rather than raising: the mic is independent
+                # of the Live connection, and tearing that down would also
+                # take typed chat with it.
+                capturing.clear()
+                failures += 1
+                print(f"[vision_live] Mic unavailable during session (attempt {failures}): {e!r}")
+                self._set_ui_status("mic_unavailable")
+                await asyncio.sleep(MIC_REOPEN_DELAY)
+                continue
 
+            if failures:
+                _log(f"MIC REOPENED after {failures} failed attempt(s). {self._hearing_state()}")
+                failures = 0
+                self._set_ui_status("speaking" if self._is_speaking else self._resting_status())
+
+            try:
+                while True:
+                    await asyncio.sleep(0.1)
+            finally:
+                capturing.clear()
+                # Bounded and off the loop thread. If it times out the stream
+                # is abandoned; the next session's _listen_audio_awake opens
+                # a fresh one.
+                await _close_audio_stream(stream, "mic")
+
+    def _make_mic_callback(self, loop, capturing: threading.Event):
         def callback(indata, frames, time_info, status):
+            if not capturing.is_set():
+                return
+
             # Just store the level — evaluate_js must never be called from
             # the realtime audio thread. _ui_level_pump forwards it.
             self._mic_level = 0.0 if self._muted else _rms_level(indata)
@@ -1459,17 +1603,7 @@ class VisionLive:
                     self._offer_mic_chunk, indata.tobytes()
                 )
 
-        try:
-            with sd.InputStream(
-                samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
-                blocksize=CHUNK_SIZE, callback=callback,
-            ):
-                while True:
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[vision_live] Mic unavailable during session: {e}")
-            self._set_ui_status("mic_unavailable")
-            raise
+        return callback
 
     def _offer_mic_chunk(self, pcm: bytes):
         """Queues a mic chunk for upload, dropping it if the uplink is
@@ -1682,10 +1816,14 @@ class VisionLive:
             print(f"[vision_live] semantic_add failed: {e}")
 
     async def _play_audio(self):
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK_SIZE,
+        # Opened and closed off the loop thread, bounded -- see _audio_call.
+        # A timeout here raises, and _run_session reconnects.
+        stream = await _open_audio_stream(
+            lambda: sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK_SIZE,
+            ),
+            "speaker",
         )
-        stream.start()
         try:
             while True:
                 chunk = await self.audio_in_queue.get()
@@ -1706,8 +1844,7 @@ class VisionLive:
                          f"{AUDIO_WRITE_TIMEOUT}s. Output device likely gone.")
                     raise
         finally:
-            stream.stop()
-            stream.close()
+            await _close_audio_stream(stream, "speaker")
 
     async def _ui_level_pump(self):
         """Forwards mic/output audio levels to the HUD visualizer at ~15fps.
